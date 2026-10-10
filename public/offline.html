@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Offline Mode — PrepPilot | NIMCET 2027</title>
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <meta name="theme-color" content="#1e3a8a" />
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        background-color: #0f172a;
+        color: #f8fafc;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 1.5rem;
+      }
+      .card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 1.5rem;
+        max-width: 480px;
+        width: 100%;
+        padding: 2.5rem 2rem;
+        text-align: center;
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4), 0 8px 10px -6px rgba(0, 0, 0, 0.4);
+      }
+      .icon-container {
+        width: 4.5rem;
+        height: 4.5rem;
+        background: rgba(30, 58, 138, 0.4);
+        border: 1px solid rgba(59, 130, 246, 0.4);
+        border-radius: 1.25rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 1.5rem auto;
+      }
+      .badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        background: rgba(245, 158, 11, 0.15);
+        color: #f59e0b;
+        border: 1px solid rgba(245, 158, 11, 0.3);
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 0.75rem;
+      }
+      h1 {
+        font-size: 1.5rem;
+        font-weight: 800;
+        margin-bottom: 0.5rem;
+        color: #ffffff;
+      }
+      p {
+        color: #94a3b8;
+        font-size: 0.875rem;
+        line-height: 1.5;
+        margin-bottom: 1.5rem;
+      }
+      .status-box {
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        border-radius: 0.75rem;
+        padding: 0.875rem 1rem;
+        margin-bottom: 1.5rem;
+        text-align: left;
+        font-size: 0.8125rem;
+        color: #cbd5e1;
+      }
+      .status-box ul {
+        list-style-type: none;
+        margin-top: 0.5rem;
+      }
+      .status-box li {
+        margin-bottom: 0.25rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .status-box li::before {
+        content: "✓";
+        color: #10b981;
+        font-weight: bold;
+      }
+      .btn-primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        background: #2563eb;
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 0.875rem;
+        padding: 0.75rem 1.5rem;
+        border-radius: 0.75rem;
+        border: none;
+        cursor: pointer;
+        transition: background-color 0.15s ease;
+        width: 100%;
+        text-decoration: none;
+      }
+      .btn-primary:hover {
+        background: #1d4ed8;
+      }
+      .app-title {
+        margin-top: 1.5rem;
+        font-size: 0.75rem;
+        color: #64748b;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="icon-container">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="1" y1="1" x2="23" y2="23"></line>
+          <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path>
+          <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path>
+          <path d="M10.71 5.05A16 16 0 0 1 22.58 9"></path>
+          <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"></path>
+          <path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path>
+          <line x1="12" y1="20" x2="12.01" y2="20"></line>
+        </svg>
+      </div>
+
+      <div class="badge">Offline Mode</div>
+      <h1>You're Currently Offline</h1>
+      <p>
+        No internet connection detected, but your study progress is safe! PrepPilot stores your syllabus, to-dos, and timetable locally.
+      </p>
+
+      <div class="status-box">
+        <strong>Offline Capabilities:</strong>
+        <ul>
+          <li>Access full NIMCET 2027 syllabus</li>
+          <li>Review spaced repetition schedules</li>
+          <li>Practice with Pomodoro study timer</li>
+          <li>Track topics and log hours locally</li>
+        </ul>
+      </div>
+
+      <button class="btn-primary" onclick="window.location.reload()">
+        Check Connection &amp; Reload
+      </button>
+
+      <div class="app-title">PrepPilot &bull; NIMCET 2027 Aspirant Cockpit</div>
+    </div>
+  </body>
+</html>

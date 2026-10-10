@@ -1,0 +1,6 @@
+{
+  "name": "PrepPilot | NIMCET 2027",
+  "description": "Comprehensive NIMCET 2027 entrance examination study planner, syllabus progress tracker, revision centre, daily timetable, and test analytics.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
