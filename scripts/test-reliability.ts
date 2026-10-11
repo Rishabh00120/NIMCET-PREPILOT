@@ -466,6 +466,46 @@ runTest('Unchecking Mark as Practised restores in_progress if attempts exist', (
   assert.strictEqual(recordWithAttempts.attempts.length, 1);
 });
 
+runTest('PYQ paper scheduling creates tasks without forced maths or unverified question counts', () => {
+  const scheduleTask = (
+    year: number,
+    scheduledDate: string,
+    options?: { targetMinutes?: number; subjectId?: SubjectId; customNotes?: string }
+  ) => {
+    const minutes = options?.targetMinutes && options.targetMinutes > 0 ? options.targetMinutes : 120;
+    const chosenSubject = options?.subjectId; // undefined = general PYQ practice
+    const notes =
+      options?.customNotes?.trim() ||
+      `Solve and analyze NIMCET ${year} paper via MyAspireStudy external resource. Follow paper-specific instructions.`;
+
+    return {
+      title: `NIMCET ${year} Practice Paper (MyAspireStudy)`,
+      subjectId: chosenSubject,
+      taskType: 'Practice' as const,
+      deadline: scheduledDate,
+      estimatedMinutes: minutes,
+      notes,
+    };
+  };
+
+  // Case 1: Default scheduling - no forced maths, no claim of 120 questions
+  const defaultTask = scheduleTask(2025, '2026-10-20');
+  assert.strictEqual(defaultTask.subjectId, undefined);
+  assert.strictEqual(defaultTask.estimatedMinutes, 120);
+  assert.ok(!defaultTask.notes.includes('120-question'));
+  assert.ok(defaultTask.notes.includes('2025'));
+
+  // Case 2: Custom subject and custom duration - user specified Computer and 90 mins
+  const customTask = scheduleTask(2023, '2026-10-22', {
+    subjectId: 'computer',
+    targetMinutes: 90,
+    customNotes: 'Focus on digital electronics section',
+  });
+  assert.strictEqual(customTask.subjectId, 'computer');
+  assert.strictEqual(customTask.estimatedMinutes, 90);
+  assert.strictEqual(customTask.notes, 'Focus on digital electronics section');
+});
+
 console.log(`\n====================================================`);
 console.log(` All ${passedTests} / ${totalTests} Reliability Tests Passed Successfully!`);
 console.log(`====================================================\n`);

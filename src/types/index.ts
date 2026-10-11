@@ -254,7 +254,6 @@ export interface UserConfig {
   notificationsPaused: boolean;
   weightingMethod: 'unweighted_topics' | 'nimcet_exam_weight';
   firstRunCompleted: boolean;
-  darkMode: boolean;
   fcmToken?: string | null;
   firebaseConnected?: boolean;
 }

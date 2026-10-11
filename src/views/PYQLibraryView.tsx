@@ -69,6 +69,9 @@ export const PYQLibraryView: React.FC = () => {
   // Schedule Task Modal State
   const [scheduleModalYear, setScheduleModalYear] = useState<number | null>(null);
   const [scheduledTargetDate, setScheduledTargetDate] = useState<string>(todayDate);
+  const [scheduleSubjectId, setScheduleSubjectId] = useState<SubjectId | ''>('');
+  const [scheduleDurationMinutes, setScheduleDurationMinutes] = useState<string>('120');
+  const [scheduleCustomNotes, setScheduleCustomNotes] = useState<string>('');
   const [scheduleSuccessMsg, setScheduleSuccessMsg] = useState<string | null>(null);
 
   // Syllabus topics available for selected subject
@@ -341,7 +344,15 @@ export const PYQLibraryView: React.FC = () => {
     e.preventDefault();
     if (scheduleModalYear === null) return;
 
-    schedulePYQPaperTask(scheduleModalYear, scheduledTargetDate);
+    const parsedMins = scheduleDurationMinutes.trim() ? Number(scheduleDurationMinutes.trim()) : 120;
+    const duration = isNaN(parsedMins) || parsedMins <= 0 ? 120 : parsedMins;
+    const subject = scheduleSubjectId ? (scheduleSubjectId as SubjectId) : undefined;
+
+    schedulePYQPaperTask(scheduleModalYear, scheduledTargetDate, {
+      targetMinutes: duration,
+      subjectId: subject,
+      customNotes: scheduleCustomNotes.trim() || undefined,
+    });
     setScheduleSuccessMsg(`Scheduled NIMCET ${scheduleModalYear} paper for ${scheduledTargetDate}`);
     setTimeout(() => {
       setScheduleSuccessMsg(null);
@@ -1112,12 +1123,59 @@ export const PYQLibraryView: React.FC = () => {
               <form onSubmit={handleConfirmSchedule} className="space-y-4 text-xs">
                 <div>
                   <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    Target Practice Date
+                    Target Practice Date <span className="text-rose-500">*</span>
                   </label>
                   <input
                     type="date"
+                    required
                     value={scheduledTargetDate}
                     onChange={(e) => setScheduledTargetDate(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Target Subject <span className="text-slate-400 font-normal">(Optional)</span>
+                  </label>
+                  <select
+                    value={scheduleSubjectId}
+                    onChange={(e) => setScheduleSubjectId(e.target.value as SubjectId | '')}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
+                  >
+                    <option value="">General PYQ Practice (No Subject)</option>
+                    {subjects.map((subj) => (
+                      <option key={subj.id} value={subj.id}>
+                        {subj.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Target Duration (Minutes) <span className="text-slate-400 font-normal">(Default: 120 mins &bull; editable)</span>
+                  </label>
+                  <input
+                    type="number"
+                    min="15"
+                    step="5"
+                    placeholder="e.g. 120"
+                    value={scheduleDurationMinutes}
+                    onChange={(e) => setScheduleDurationMinutes(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-white font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Custom Notes <span className="text-slate-400 font-normal">(Optional)</span>
+                  </label>
+                  <textarea
+                    rows={2}
+                    placeholder="e.g. Focus on speed and review unattempted questions afterward"
+                    value={scheduleCustomNotes}
+                    onChange={(e) => setScheduleCustomNotes(e.target.value)}
                     className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
                   />
                 </div>

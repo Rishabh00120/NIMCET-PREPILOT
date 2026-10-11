@@ -173,7 +173,15 @@ interface AppContextType {
   updatePYQPaperAttempt: (year: number, attemptId: string, updates: Partial<Omit<PYQPaperAttempt, 'id'>>) => void;
   updatePYQPaperStatus: (year: number, status: PYQPaperStatus) => void;
   markPYQPaperOpened: (year: number) => void;
-  schedulePYQPaperTask: (year: number, scheduledDate: string) => void;
+  schedulePYQPaperTask: (
+    year: number,
+    scheduledDate: string,
+    options?: {
+      targetMinutes?: number;
+      subjectId?: SubjectId;
+      customNotes?: string;
+    }
+  ) => void;
   pyqPapersTotalCount: number;
   pyqPapersPractisedCount: number;
   pyqPapersRemainingCount: number;
@@ -281,7 +289,6 @@ export const INITIAL_USER_CONFIG: UserConfig = {
   notificationsPaused: false,
   weightingMethod: 'unweighted_topics',
   firstRunCompleted: false,
-  darkMode: false,
 };
 
 const DEFAULT_FOCUS_STATE: FocusSessionState = {
@@ -516,14 +523,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     recoverFromIDBIfLocalStorageEmpty();
   }, []);
 
-  // Apply dark mode class to document
+  // Ensure documentElement always has 'dark' class permanently
   useEffect(() => {
-    if (userConfig.darkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  }, [userConfig.darkMode]);
+    document.documentElement.classList.add('dark');
+  }, []);
 
   // Save changes to localStorage & mirror to IndexedDB for durable offline reliability
   useEffect(() => {
@@ -1472,18 +1475,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [todayDate]);
 
   const schedulePYQPaperTask = useCallback(
-    (year: number, scheduledDate: string) => {
+    (
+      year: number,
+      scheduledDate: string,
+      options?: {
+        targetMinutes?: number;
+        subjectId?: SubjectId;
+        customNotes?: string;
+      }
+    ) => {
+      const minutes = options?.targetMinutes && options.targetMinutes > 0 ? options.targetMinutes : 120;
+      const chosenSubject = options?.subjectId; // undefined = general PYQ practice
+      const notes =
+        options?.customNotes?.trim() ||
+        `Solve and analyze NIMCET ${year} paper via MyAspireStudy external resource. Follow paper-specific instructions.`;
+
       addTask({
-        title: `Solve NIMCET ${year} Full Paper (MyAspireStudy)`,
-        subjectId: 'maths',
+        title: `NIMCET ${year} Practice Paper (MyAspireStudy)`,
+        subjectId: chosenSubject,
         taskType: 'Practice',
         startDate: todayDate,
         deadline: scheduledDate,
         priority: 'high',
         status: 'pending',
-        estimatedMinutes: 120,
+        estimatedMinutes: minutes,
         actualMinutes: 0,
-        notes: `Simulate 120-question NIMCET ${year} paper under 2-hour exam conditions.`,
+        notes,
       });
     },
     [todayDate, addTask]
@@ -1649,7 +1666,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (parsed.errorLogs) setErrorLogs(parsed.errorLogs);
       if (parsed.revisionItems) setRevisionItems(parsed.revisionItems);
       if (parsed.monthlyGoals) setMonthlyGoals(parsed.monthlyGoals);
-      if (parsed.userConfig) setUserConfig(parsed.userConfig);
+      if (parsed.userConfig) {
+        // Strip obsolete darkMode property if present in old backup files
+        const { darkMode: _obsoleteDarkMode, ...cleanConfig } = parsed.userConfig as any;
+        setUserConfig((prev) => ({ ...prev, ...cleanConfig }));
+      }
       if (parsed.celebratedBadgeIds) setCelebratedBadgeIds(parsed.celebratedBadgeIds);
       if (parsed.pyqPaperRecords) setPyqPaperRecords(parsed.pyqPaperRecords);
       return true;
