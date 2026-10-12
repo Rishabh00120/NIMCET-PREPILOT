@@ -8,6 +8,8 @@ import { TopicDetailModal } from './components/TopicDetailModal';
 import { MilestoneCelebrationModal } from './components/MilestoneCelebrationModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAUpdatePrompt } from './components/PWAUpdatePrompt';
+import { AuthModal } from './components/AuthModal';
+import { DataMigrationModal } from './components/DataMigrationModal';
 
 // Views
 import { DashboardView } from './views/DashboardView';
@@ -95,6 +97,8 @@ const MainLayout: React.FC = () => {
       />
       <OfflineIndicator />
       <PWAUpdatePrompt />
+      <AuthModal />
+      <DataMigrationModal />
     </div>
   );
 };

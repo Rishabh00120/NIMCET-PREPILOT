@@ -68,6 +68,8 @@ export interface TaskItem {
   notes: string;
   completedAt?: string;
   createdAt: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface TimetableSlot {
@@ -79,6 +81,8 @@ export interface TimetableSlot {
   chapterId?: string;
   isBreak?: boolean;
   dayPattern?: 'daily' | 'mwf' | 'tts'; // rotational support
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface LoggedStudySession {
@@ -96,6 +100,8 @@ export interface LoggedStudySession {
   actualMinutes: number;
   notes: string;
   loggedAt: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface PYQEntry {
@@ -113,6 +119,8 @@ export interface PYQEntry {
   mistakesNotes: string;
   needsRedo: boolean;
   createdAt: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export type MockTestType = 'topic_quiz' | 'chapter_test' | 'sectional' | 'full_mock';
@@ -135,6 +143,8 @@ export interface MockTest {
   weakTopics: string[];
   followUpTasks: string[];
   retestDate?: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export type MistakeCategory = 
@@ -157,6 +167,8 @@ export interface ErrorLogEntry {
   needsRedo: boolean;
   resolved: boolean;
   resolvedAt?: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface SpacedRevisionItem {
@@ -172,6 +184,8 @@ export interface SpacedRevisionItem {
     completedAt?: string;
   }[];
   notes: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface MonthlyGoal {

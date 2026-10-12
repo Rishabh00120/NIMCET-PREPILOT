@@ -38,6 +38,29 @@ import {
   parseDateAtNoon,
 } from '../utils/dateUtils';
 import { PYQ_PAPER_LINKS } from '../data/pyqLinks';
+import {
+  isFirebaseConfigured,
+  signInWithGoogle,
+  signInWithEmailPassword,
+  signUpWithEmailPassword,
+  sendPasswordResetEmailUser,
+  sendEmailVerificationUser,
+  reloadCurrentUser,
+  signOutUser,
+  subscribeToAuthChanges,
+  fetchRemoteUserData,
+  uploadFullLocalDataToRemote,
+  syncEntityUpdateToFirestore,
+  subscribeToRemoteUserData,
+  mergeLocalAndRemoteData,
+  mergeItemsById,
+  hasCustomUserData,
+  savePreMigrationBackup,
+  getPreMigrationBackups,
+  type FullUserDataPayload,
+  type SyncStatusState,
+} from '../services/firebase';
+import type { User as FirebaseUser } from 'firebase/auth';
 
 const STORAGE_KEY = 'preppilot_nimcet2027_v1';
 
@@ -265,6 +288,46 @@ interface AppContextType {
   dismissNotification: (id: string) => void;
   snoozeNotification: (id: string, hours?: number) => void;
   clearAllNotifications: () => void;
+
+  // Authentication & Cloud Sync
+  currentUser: FirebaseUser | null;
+  authLoading: boolean;
+  syncStatusState: SyncStatusState;
+  lastCloudSyncAt: string | null;
+  syncErrorMessage: string | null;
+  hasPendingOfflineChanges: boolean;
+  isFirebaseConfigured: boolean;
+
+  authModalOpen: boolean;
+  authModalMode: 'login' | 'signup' | 'forgot_password' | 'verify_email';
+  openAuthModal: (mode?: 'login' | 'signup' | 'forgot_password' | 'verify_email') => void;
+  closeAuthModal: () => void;
+
+  signInWithGoogle: () => Promise<{ success: boolean; error?: string }>;
+  signInWithEmail: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
+  signUpWithEmail: (
+    email: string,
+    pass: string,
+    displayName?: string
+  ) => Promise<{ success: boolean; error?: string; verificationSent?: boolean }>;
+  sendPasswordReset: (email: string) => Promise<{ success: boolean; error?: string }>;
+  resendVerificationEmail: () => Promise<{ success: boolean; error?: string }>;
+  checkEmailVerification: () => Promise<{ verified: boolean; error?: string }>;
+  signOut: () => Promise<void>;
+  forceCloudSync: () => Promise<void>;
+
+  // First-time Safe Data Migration
+  migrationPrompt: {
+    isOpen: boolean;
+    localData: FullUserDataPayload;
+    remoteData: FullUserDataPayload | null;
+    isRemoteEmpty: boolean;
+    isLocalEmpty: boolean;
+    user: FirebaseUser;
+  } | null;
+  resolveMigration: (strategy: 'merge' | 'upload_local' | 'use_cloud') => Promise<void>;
+  dismissMigration: () => void;
+  restorePreMigrationBackupKey: (backupKey: string) => boolean;
 
   continueStudying: () => void;
   exportBackupJSON: () => void;
@@ -585,7 +648,662 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     pyqPaperRecords,
   ]);
 
-  // Flattened trackable topics
+  // ===========================================================================
+  // Firebase Authentication & Cloud Sync State
+  // ===========================================================================
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [syncStatusState, setSyncStatusState] = useState<SyncStatusState>(
+    isFirebaseConfigured() ? 'local_only' : 'offline'
+  );
+  const [lastCloudSyncAt, setLastCloudSyncAt] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(`${STORAGE_KEY}_last_cloud_sync`) || null;
+    } catch {
+      return null;
+    }
+  });
+  const [syncErrorMessage, setSyncErrorMessage] = useState<string | null>(null);
+  const isRemoteApplyingRef = useRef<boolean>(false);
+  const debounceTimerRef = useRef<any>(null);
+
+  // Auth modal controls
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authModalMode, setAuthModalMode] = useState<'login' | 'signup' | 'forgot_password' | 'verify_email'>('login');
+
+  const openAuthModal = useCallback(
+    (mode: 'login' | 'signup' | 'forgot_password' | 'verify_email' = 'login') => {
+      setAuthModalMode(mode);
+      setAuthModalOpen(true);
+    },
+    []
+  );
+
+  const closeAuthModal = useCallback(() => {
+    setAuthModalOpen(false);
+  }, []);
+
+  // Offline pending changes flag
+  const [hasPendingOfflineChanges, setHasPendingOfflineChanges] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(`${STORAGE_KEY}_has_pending_offline`) === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const markPendingOffline = useCallback((pending: boolean) => {
+    setHasPendingOfflineChanges(pending);
+    try {
+      localStorage.setItem(`${STORAGE_KEY}_has_pending_offline`, pending ? 'true' : 'false');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // First-time Safe Data Migration Prompt State
+  const [migrationPrompt, setMigrationPrompt] = useState<{
+    isOpen: boolean;
+    localData: FullUserDataPayload;
+    remoteData: FullUserDataPayload | null;
+    isRemoteEmpty: boolean;
+    isLocalEmpty: boolean;
+    user: FirebaseUser;
+  } | null>(null);
+
+  // Helper to apply a full payload into React state without re-triggering remote save echo
+  const applyRemotePayload = useCallback((data: FullUserDataPayload) => {
+    isRemoteApplyingRef.current = true;
+    if (data.tasks) setTasks(data.tasks);
+    if (data.subjects) setSubjects(data.subjects);
+    if (data.timetableSlots) setTimetableSlots(data.timetableSlots);
+    if (data.studySessions) setStudySessions(data.studySessions);
+    if (data.pyqEntries) setPyqEntries(data.pyqEntries);
+    if (data.mockTests) setMockTests(data.mockTests);
+    if (data.errorLogs) setErrorLogs(data.errorLogs);
+    if (data.revisionItems) setRevisionItems(data.revisionItems);
+    if (data.monthlyGoals) setMonthlyGoals(data.monthlyGoals);
+    if (data.pyqPaperRecords) setPyqPaperRecords(data.pyqPaperRecords);
+    if (data.userConfig) setUserConfig((prev) => ({ ...prev, ...data.userConfig }));
+
+    setTimeout(() => {
+      isRemoteApplyingRef.current = false;
+    }, 500);
+  }, []);
+
+  // Keep a ref to the latest complete local state to prevent capturing stale closure in auth listener
+  const localStateRef = useRef<FullUserDataPayload>({
+    tasks,
+    subjects,
+    timetableSlots,
+    studySessions,
+    pyqEntries,
+    mockTests,
+    errorLogs,
+    revisionItems,
+    monthlyGoals,
+    userConfig,
+    pyqPaperRecords,
+  });
+
+  useEffect(() => {
+    localStateRef.current = {
+      tasks,
+      subjects,
+      timetableSlots,
+      studySessions,
+      pyqEntries,
+      mockTests,
+      errorLogs,
+      revisionItems,
+      monthlyGoals,
+      userConfig,
+      pyqPaperRecords,
+    };
+  }, [
+    tasks,
+    subjects,
+    timetableSlots,
+    studySessions,
+    pyqEntries,
+    mockTests,
+    errorLogs,
+    revisionItems,
+    monthlyGoals,
+    userConfig,
+    pyqPaperRecords,
+  ]);
+
+  // Monitor Firebase Auth state changes
+  useEffect(() => {
+    if (!isFirebaseConfigured()) {
+      setAuthLoading(false);
+      setSyncStatusState('offline');
+      return;
+    }
+
+    const unsub = subscribeToAuthChanges(async (user) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+
+      if (user) {
+        setSyncStatusState('syncing');
+        setSyncErrorMessage(null);
+
+        try {
+          // 1. Fetch remote user document
+          const remoteRes = await fetchRemoteUserData(user.uid);
+
+          // If read encountered an explicit error (e.g. permission-denied or network failure),
+          // DO NOT treat this as an empty user account; flag it as error and preserve local state!
+          if (remoteRes.error) {
+            setSyncStatusState('error');
+            setSyncErrorMessage(remoteRes.error);
+            markPendingOffline(true);
+            return;
+          }
+
+          // Use the latest local state from localStateRef
+          const currentLocal: FullUserDataPayload = localStateRef.current;
+          const migrationKey = `${STORAGE_KEY}_migrated_${user.uid}`;
+          const alreadyMigrated = localStorage.getItem(migrationKey) === 'true';
+
+          const localHasData = hasCustomUserData(currentLocal);
+          const remoteHasData = remoteRes.exists && remoteRes.data && hasCustomUserData(remoteRes.data);
+
+          // FIRST-TIME SAFE MIGRATION CHECK:
+          // If both local and remote have custom data, and user hasn't explicitly resolved migration on this device
+          if (!alreadyMigrated && localHasData && remoteHasData && remoteRes.data) {
+            // Guarantee an automatic safety backup of local state first
+            savePreMigrationBackup(currentLocal);
+
+            setMigrationPrompt({
+              isOpen: true,
+              localData: currentLocal,
+              remoteData: remoteRes.data,
+              isRemoteEmpty: false,
+              isLocalEmpty: false,
+              user,
+            });
+            setSyncStatusState('synced');
+            return;
+          }
+
+          // If local has data but remote is clean/empty (first-time user account creation on device)
+          if (!alreadyMigrated && localHasData && !remoteHasData) {
+            savePreMigrationBackup(currentLocal);
+            const uploadRes = await uploadFullLocalDataToRemote(user.uid, currentLocal);
+            if (!uploadRes.success) {
+              setSyncStatusState('error');
+              setSyncErrorMessage(uploadRes.error || 'Failed to initialize cloud database');
+              markPendingOffline(true);
+              return;
+            }
+            try {
+              localStorage.setItem(migrationKey, 'true');
+            } catch {}
+            markPendingOffline(false);
+            const nowIso = new Date().toISOString();
+            setLastCloudSyncAt(nowIso);
+            try {
+              localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+            } catch {}
+            setSyncStatusState('synced');
+            return;
+          }
+
+          // If remote has data but local has no custom data (new phone/laptop signing into existing account)
+          if (!alreadyMigrated && !localHasData && remoteHasData && remoteRes.data) {
+            applyRemotePayload(remoteRes.data);
+            try {
+              localStorage.setItem(migrationKey, 'true');
+            } catch {}
+            markPendingOffline(false);
+            const nowIso = new Date().toISOString();
+            setLastCloudSyncAt(nowIso);
+            try {
+              localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+            } catch {}
+            setSyncStatusState('synced');
+            return;
+          }
+
+          // Standard continuous sync or already migrated user
+          if (remoteRes.exists && remoteRes.data) {
+            // Merge local and cloud data safely using deterministic conflict resolution
+            const merged = mergeLocalAndRemoteData(currentLocal, remoteRes.data);
+            applyRemotePayload(merged);
+
+            // Update cloud with merged state and verify result
+            const uploadRes = await uploadFullLocalDataToRemote(user.uid, merged);
+            if (!uploadRes.success) {
+              setSyncStatusState('error');
+              setSyncErrorMessage(uploadRes.error || 'Failed to upload merged state to Cloud Firestore');
+              markPendingOffline(true);
+              return;
+            }
+          } else {
+            // First time cloud user with no existing cloud document: upload local state to remote
+            const uploadRes = await uploadFullLocalDataToRemote(user.uid, currentLocal);
+            if (!uploadRes.success) {
+              setSyncStatusState('error');
+              setSyncErrorMessage(uploadRes.error || 'Failed to initialize cloud database document');
+              markPendingOffline(true);
+              return;
+            }
+          }
+
+          try {
+            localStorage.setItem(migrationKey, 'true');
+          } catch {}
+          markPendingOffline(false);
+          const nowIso = new Date().toISOString();
+          setLastCloudSyncAt(nowIso);
+          try {
+            localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+          } catch {}
+          setSyncStatusState('synced');
+        } catch (err: any) {
+          console.error('Initial Cloud Sync Error:', err);
+          setSyncStatusState('error');
+          setSyncErrorMessage(err?.message || 'Initial cloud sync failed');
+          markPendingOffline(true);
+        }
+      } else {
+        setSyncStatusState('local_only');
+      }
+    });
+
+    return () => unsub();
+  }, [applyRemotePayload, markPendingOffline]);
+
+  // Real-time live listener across authenticated devices (laptop & phone)
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const unsub = subscribeToRemoteUserData(
+      currentUser.uid,
+      (remoteData) => {
+        // Prevent echo-loop if this client initiated the write
+        if (isRemoteApplyingRef.current) return;
+
+        isRemoteApplyingRef.current = true;
+        // 1. Tasks
+        setTasks((prev) => mergeItemsById(prev, remoteData.tasks));
+        // 2. Study Sessions
+        setStudySessions((prev) => mergeItemsById(prev, remoteData.studySessions));
+        // 3. PYQ Entries
+        setPyqEntries((prev) => mergeItemsById(prev, remoteData.pyqEntries));
+        // 4. Mock Tests
+        setMockTests((prev) => mergeItemsById(prev, remoteData.mockTests));
+        // 5. Error Logs
+        setErrorLogs((prev) => mergeItemsById(prev, remoteData.errorLogs));
+        // 6. Revision Items
+        setRevisionItems((prev) => mergeItemsById(prev, remoteData.revisionItems));
+        // 7. Timetable Slots
+        if (remoteData.timetableSlots && remoteData.timetableSlots.length > 0) {
+          setTimetableSlots((prev) => mergeItemsById(prev, remoteData.timetableSlots));
+        }
+        // 8. Monthly Goals
+        if (remoteData.monthlyGoals && remoteData.monthlyGoals.length > 0) {
+          setMonthlyGoals((prev) => {
+            const map = new Map<string, MonthlyGoal>();
+            for (const g of prev) map.set(g.monthKey, g);
+            for (const g of remoteData.monthlyGoals) map.set(g.monthKey, g);
+            return Array.from(map.values());
+          });
+        }
+        // 9. PYQ Paper Records
+        if (remoteData.pyqPaperRecords && Object.keys(remoteData.pyqPaperRecords).length > 0) {
+          setPyqPaperRecords((prev) => ({ ...prev, ...remoteData.pyqPaperRecords }));
+        }
+        // 10. Subjects & Topic Completion
+        if (remoteData.subjects && remoteData.subjects.length > 0) {
+          setSubjects((prev) => {
+            return prev.map((localSubj) => {
+              const remoteSubj = remoteData.subjects.find((s) => s.id === localSubj.id);
+              if (!remoteSubj) return localSubj;
+
+              return {
+                ...localSubj,
+                chapters: localSubj.chapters.map((localCh) => {
+                  const remoteCh = remoteSubj.chapters.find((c) => c.id === localCh.id);
+                  if (!remoteCh) return localCh;
+
+                  return {
+                    ...localCh,
+                    topics: localCh.topics.map((localTop) => {
+                      const remoteTop = remoteCh.topics.find((t) => t.id === localTop.id);
+                      if (!remoteTop) return localTop;
+
+                      const isCompleted = localTop.completed || remoteTop.completed;
+                      const completedAt = localTop.completedAt || remoteTop.completedAt;
+                      const questionsSolved = Math.max(localTop.questionsSolved || 0, remoteTop.questionsSolved || 0);
+                      const questionsCorrect = Math.max(localTop.questionsCorrect || 0, remoteTop.questionsCorrect || 0);
+                      const actualHours = Math.max(localTop.actualHours || 0, remoteTop.actualHours || 0);
+
+                      return {
+                        ...localTop,
+                        completed: isCompleted,
+                        completedAt,
+                        questionsSolved,
+                        questionsCorrect,
+                        actualHours,
+                        status: isCompleted ? 'completed' : localTop.status !== 'not_started' ? localTop.status : remoteTop.status,
+                      };
+                    }),
+                  };
+                }),
+              };
+            });
+          });
+        }
+        // 11. User Config
+        if (remoteData.userConfig && Object.keys(remoteData.userConfig).length > 0) {
+          setUserConfig((prev) => ({ ...prev, ...remoteData.userConfig }));
+        }
+
+        const nowIso = new Date().toISOString();
+        setLastCloudSyncAt(nowIso);
+        setSyncStatusState('synced');
+        setTimeout(() => {
+          isRemoteApplyingRef.current = false;
+        }, 300);
+      },
+      (error) => {
+        console.warn('Live remote subscription error:', error);
+        setSyncStatusState('error');
+        setSyncErrorMessage(error.message || 'Live synchronization disconnected');
+      }
+    );
+
+    return () => unsub();
+  }, [currentUser]);
+
+  // Debounced auto-sync to Cloud Firestore when local state mutates
+  useEffect(() => {
+    if (!currentUser || !isHydratedRef.current || isRemoteApplyingRef.current) return;
+
+    setSyncStatusState('syncing');
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+
+    debounceTimerRef.current = setTimeout(async () => {
+      try {
+        const payload: FullUserDataPayload = {
+          tasks,
+          subjects,
+          timetableSlots,
+          studySessions,
+          pyqEntries,
+          mockTests,
+          errorLogs,
+          revisionItems,
+          monthlyGoals,
+          userConfig,
+          pyqPaperRecords,
+        };
+
+        const result = await uploadFullLocalDataToRemote(currentUser.uid, payload);
+        if (result.success) {
+          const nowIso = new Date().toISOString();
+          setLastCloudSyncAt(nowIso);
+          setSyncStatusState('synced');
+          setSyncErrorMessage(null);
+          markPendingOffline(false);
+          try {
+            localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+          } catch {
+            // ignore
+          }
+        } else {
+          setSyncStatusState('error');
+          setSyncErrorMessage(result.error || 'Failed to save to Cloud Firestore');
+          markPendingOffline(true);
+        }
+      } catch (err: any) {
+        console.error('Debounced sync error:', err);
+        setSyncStatusState('error');
+        setSyncErrorMessage(err?.message || 'Failed to sync with cloud');
+        markPendingOffline(true);
+      }
+    }, 1200);
+
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, [
+    currentUser,
+    tasks,
+    subjects,
+    timetableSlots,
+    studySessions,
+    pyqEntries,
+    mockTests,
+    errorLogs,
+    revisionItems,
+    monthlyGoals,
+    userConfig,
+    pyqPaperRecords,
+    markPendingOffline,
+  ]);
+
+  // Manual Trigger to force cloud sync
+  const forceCloudSync = useCallback(async () => {
+    if (!currentUser) {
+      setSyncErrorMessage('Please sign in to sync with Cloud Firestore.');
+      return;
+    }
+
+    setSyncStatusState('syncing');
+    setSyncErrorMessage(null);
+
+    try {
+      const payload: FullUserDataPayload = {
+        tasks,
+        subjects,
+        timetableSlots,
+        studySessions,
+        pyqEntries,
+        mockTests,
+        errorLogs,
+        revisionItems,
+        monthlyGoals,
+        userConfig,
+        pyqPaperRecords,
+      };
+
+      const result = await uploadFullLocalDataToRemote(currentUser.uid, payload);
+      if (result.success) {
+        const nowIso = new Date().toISOString();
+        setLastCloudSyncAt(nowIso);
+        setSyncStatusState('synced');
+        markPendingOffline(false);
+        try {
+          localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+        } catch {
+          // ignore
+        }
+      } else {
+        setSyncStatusState('error');
+        setSyncErrorMessage(result.error || 'Cloud sync failed');
+        markPendingOffline(true);
+      }
+    } catch (err: any) {
+      setSyncStatusState('error');
+      setSyncErrorMessage(err?.message || 'Cloud sync failed');
+      markPendingOffline(true);
+    }
+  }, [
+    currentUser,
+    tasks,
+    subjects,
+    timetableSlots,
+    studySessions,
+    pyqEntries,
+    mockTests,
+    errorLogs,
+    revisionItems,
+    monthlyGoals,
+    userConfig,
+    pyqPaperRecords,
+    markPendingOffline,
+  ]);
+
+  // Handle Google Sign In
+  const handleSignInWithGoogle = useCallback(async () => {
+    setSyncStatusState('signing_in');
+    setSyncErrorMessage(null);
+    const result = await signInWithGoogle();
+    if (result.error) {
+      setSyncStatusState(currentUser ? 'synced' : 'local_only');
+      setSyncErrorMessage(result.error);
+      return { success: false, error: result.error };
+    }
+    closeAuthModal();
+    return { success: true };
+  }, [currentUser, closeAuthModal]);
+
+  // Handle Email & Password Sign In
+  const handleSignInWithEmail = useCallback(
+    async (email: string, pass: string) => {
+      setSyncStatusState('signing_in');
+      setSyncErrorMessage(null);
+      const result = await signInWithEmailPassword(email, pass);
+      if (result.error) {
+        setSyncStatusState(currentUser ? 'synced' : 'local_only');
+        setSyncErrorMessage(result.error);
+        return { success: false, error: result.error };
+      }
+      closeAuthModal();
+      return { success: true };
+    },
+    [currentUser, closeAuthModal]
+  );
+
+  // Handle Email & Password Sign Up
+  const handleSignUpWithEmail = useCallback(
+    async (email: string, pass: string, displayName?: string) => {
+      setSyncStatusState('signing_in');
+      setSyncErrorMessage(null);
+      const result = await signUpWithEmailPassword(email, pass, displayName);
+      if (result.error) {
+        setSyncStatusState(currentUser ? 'synced' : 'local_only');
+        setSyncErrorMessage(result.error);
+        return { success: false, error: result.error };
+      }
+      return { success: true, verificationSent: result.verificationSent };
+    },
+    [currentUser]
+  );
+
+  // Handle Password Reset
+  const handleSendPasswordReset = useCallback(async (email: string) => {
+    return await sendPasswordResetEmailUser(email);
+  }, []);
+
+  // Handle Resend Verification Email
+  const handleResendVerificationEmail = useCallback(async () => {
+    return await sendEmailVerificationUser();
+  }, []);
+
+  // Handle Check Email Verification
+  const handleCheckEmailVerification = useCallback(async () => {
+    const res = await reloadCurrentUser();
+    if (res.error) {
+      return { verified: false, error: res.error };
+    }
+    if (res.user) {
+      setCurrentUser(res.user);
+      return { verified: !!res.user.emailVerified };
+    }
+    return { verified: false };
+  }, []);
+
+  // Handle Sign Out
+  const handleSignOut = useCallback(async () => {
+    await signOutUser();
+    setCurrentUser(null);
+    setSyncStatusState('local_only');
+    setSyncErrorMessage(null);
+  }, []);
+
+  // Resolve First-Time Data Migration Selection
+  const resolveMigration = useCallback(
+    async (strategy: 'merge' | 'upload_local' | 'use_cloud') => {
+      if (!migrationPrompt || !currentUser) return;
+      const { localData, remoteData, user } = migrationPrompt;
+      const migrationKey = `${STORAGE_KEY}_migrated_${user.uid}`;
+      setSyncStatusState('syncing');
+      setSyncErrorMessage(null);
+
+      try {
+        // Guarantee safety backup
+        savePreMigrationBackup(localData);
+
+        if (strategy === 'merge' && remoteData) {
+          const merged = mergeLocalAndRemoteData(localData, remoteData);
+          applyRemotePayload(merged);
+          const res = await uploadFullLocalDataToRemote(user.uid, merged);
+          if (!res.success) {
+            setSyncStatusState('error');
+            setSyncErrorMessage(res.error || 'Failed to upload merged state to Cloud Firestore');
+            markPendingOffline(true);
+            return;
+          }
+        } else if (strategy === 'upload_local') {
+          applyRemotePayload(localData);
+          const res = await uploadFullLocalDataToRemote(user.uid, localData);
+          if (!res.success) {
+            setSyncStatusState('error');
+            setSyncErrorMessage(res.error || 'Failed to upload local state to Cloud Firestore');
+            markPendingOffline(true);
+            return;
+          }
+        } else if (strategy === 'use_cloud' && remoteData) {
+          applyRemotePayload(remoteData);
+        }
+
+        try {
+          localStorage.setItem(migrationKey, 'true');
+        } catch {}
+        markPendingOffline(false);
+        const nowIso = new Date().toISOString();
+        setLastCloudSyncAt(nowIso);
+        try {
+          localStorage.setItem(`${STORAGE_KEY}_last_cloud_sync`, nowIso);
+        } catch {}
+        setSyncStatusState('synced');
+        setMigrationPrompt(null);
+      } catch (err: any) {
+        console.error('Migration resolution error:', err);
+        setSyncStatusState('error');
+        setSyncErrorMessage(err?.message || 'Failed to complete migration');
+        markPendingOffline(true);
+      }
+    },
+    [migrationPrompt, currentUser, applyRemotePayload, markPendingOffline]
+  );
+
+  const dismissMigration = useCallback(() => {
+    setMigrationPrompt(null);
+  }, []);
+
+  const restorePreMigrationBackupKey = useCallback(
+    (backupKey: string): boolean => {
+      try {
+        const raw = localStorage.getItem(backupKey);
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        if (!parsed.payload) return false;
+        applyRemotePayload(parsed.payload);
+        return true;
+      } catch (err) {
+        console.error('Failed to restore backup key:', err);
+        return false;
+      }
+    },
+    [applyRemotePayload]
+  );
   const allTrackableTopics = useMemo(() => {
     return getAllTrackableTopics(subjects);
   }, [subjects]);
@@ -1857,6 +2575,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     dismissNotification,
     snoozeNotification,
     clearAllNotifications,
+    currentUser,
+    authLoading,
+    syncStatusState,
+    lastCloudSyncAt,
+    syncErrorMessage,
+    hasPendingOfflineChanges,
+    isFirebaseConfigured: isFirebaseConfigured(),
+    authModalOpen,
+    authModalMode,
+    openAuthModal,
+    closeAuthModal,
+    signInWithGoogle: handleSignInWithGoogle,
+    signInWithEmail: handleSignInWithEmail,
+    signUpWithEmail: handleSignUpWithEmail,
+    sendPasswordReset: handleSendPasswordReset,
+    resendVerificationEmail: handleResendVerificationEmail,
+    checkEmailVerification: handleCheckEmailVerification,
+    signOut: handleSignOut,
+    forceCloudSync,
+    migrationPrompt,
+    resolveMigration,
+    dismissMigration,
+    restorePreMigrationBackupKey,
     continueStudying,
     exportBackupJSON,
     importBackupJSON,

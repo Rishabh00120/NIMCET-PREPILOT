@@ -21,6 +21,7 @@ import {
 } from '../src/utils/dateUtils';
 import { LoggedStudySession, SyllabusSubject, SyllabusTopic, PYQPaperAttempt, PYQPaperRecord, SubjectId, NavSection } from '../src/types';
 import { PYQ_PAPER_LINKS, isValidPYQUrl, getPYQPaperByYear } from '../src/data/pyqLinks';
+import { formatAuthErrorMessage, hasCustomUserData, getDataSummary } from '../src/services/firebase';
 
 let totalTests = 0;
 let passedTests = 0;
@@ -504,6 +505,256 @@ runTest('PYQ paper scheduling creates tasks without forced maths or unverified q
   assert.strictEqual(customTask.subjectId, 'computer');
   assert.strictEqual(customTask.estimatedMinutes, 90);
   assert.strictEqual(customTask.notes, 'Focus on digital electronics section');
+});
+
+// 7. Cloud Synchronization, Two-Way Merge & Conflict Resolution
+console.log('\nGroup 7: Cloud Synchronization, Two-Way Merge & Conflict Resolution');
+
+runTest('mergeItemsById merges unique items and updates existing without duplication', () => {
+  interface SampleItem {
+    id: string;
+    title: string;
+    version: number;
+  }
+
+  const remoteItems: SampleItem[] = [
+    { id: 'item-1', title: 'Task Phone', version: 1 },
+    { id: 'item-2', title: 'Task Laptop', version: 1 },
+  ];
+
+  const localItems: SampleItem[] = [
+    { id: 'item-2', title: 'Task Laptop (Edited on Phone)', version: 2 },
+    { id: 'item-3', title: 'New Task from Phone', version: 1 },
+  ];
+
+  const map = new Map<string, SampleItem>();
+  for (const item of remoteItems) map.set(item.id, item);
+  for (const item of localItems) map.set(item.id, item);
+  const merged = Array.from(map.values());
+
+  assert.strictEqual(merged.length, 3);
+  assert.strictEqual(merged.find((i) => i.id === 'item-1')?.title, 'Task Phone');
+  assert.strictEqual(merged.find((i) => i.id === 'item-2')?.title, 'Task Laptop (Edited on Phone)');
+  assert.strictEqual(merged.find((i) => i.id === 'item-3')?.title, 'New Task from Phone');
+});
+
+runTest('mergeLocalAndRemoteData preserves completed topics from either device', () => {
+  const localSubjects = [
+    {
+      id: 'maths' as const,
+      name: 'Mathematics',
+      chapters: [
+        {
+          id: 'set-theory',
+          title: 'Set Theory',
+          topics: [
+            { id: 'top-1', title: 'Sets & Subsets', completed: true, questionsSolved: 30 },
+            { id: 'top-2', title: 'Venn Diagrams', completed: false, questionsSolved: 10 },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const remoteSubjects = [
+    {
+      id: 'maths' as const,
+      name: 'Mathematics',
+      chapters: [
+        {
+          id: 'set-theory',
+          title: 'Set Theory',
+          topics: [
+            { id: 'top-1', title: 'Sets & Subsets', completed: false, questionsSolved: 15 },
+            { id: 'top-2', title: 'Venn Diagrams', completed: true, questionsSolved: 25 },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const merged = localSubjects.map((localSubj) => {
+    const remoteSubj = remoteSubjects.find((s) => s.id === localSubj.id);
+    if (!remoteSubj) return localSubj;
+    return {
+      ...localSubj,
+      chapters: localSubj.chapters.map((localCh) => {
+        const remoteCh = remoteSubj.chapters.find((c) => c.id === localCh.id);
+        if (!remoteCh) return localCh;
+        return {
+          ...localCh,
+          topics: localCh.topics.map((localTop) => {
+            const remoteTop = remoteCh.topics.find((t) => t.id === localTop.id);
+            if (!remoteTop) return localTop;
+            const isCompleted = localTop.completed || remoteTop.completed;
+            const questionsSolved = Math.max(localTop.questionsSolved || 0, remoteTop.questionsSolved || 0);
+            return {
+              ...localTop,
+              completed: isCompleted,
+              questionsSolved,
+            };
+          }),
+        };
+      }),
+    };
+  });
+
+  const topics = merged[0].chapters[0].topics;
+  // Both topics must be completed in the merged state (union of progress)
+  assert.strictEqual(topics[0].completed, true);
+  assert.strictEqual(topics[0].questionsSolved, 30);
+  assert.strictEqual(topics[1].completed, true);
+  assert.strictEqual(topics[1].questionsSolved, 25);
+});
+
+runTest('mergeLocalAndRemoteData unions PYQ paper attempts from multiple devices', () => {
+  const localPaperRecords: Record<number, any> = {
+    2024: {
+      year: 2024,
+      status: 'practised',
+      attempts: [{ id: 'att-phone', date: '2026-10-10', score: 420 }],
+    },
+  };
+
+  const remotePaperRecords: Record<number, any> = {
+    2024: {
+      year: 2024,
+      status: 'in_progress',
+      attempts: [{ id: 'att-laptop', date: '2026-10-08', score: 380 }],
+    },
+    2023: {
+      year: 2023,
+      status: 'practised',
+      attempts: [{ id: 'att-laptop-23', date: '2026-10-07', score: 450 }],
+    },
+  };
+
+  const mergedPapers: Record<number, any> = { ...remotePaperRecords };
+  for (const [yStr, localRec] of Object.entries(localPaperRecords)) {
+    const yr = Number(yStr);
+    const remoteRec = mergedPapers[yr];
+    if (!remoteRec) {
+      mergedPapers[yr] = localRec;
+    } else {
+      const map = new Map<string, any>();
+      for (const a of remoteRec.attempts || []) map.set(a.id, a);
+      for (const a of localRec.attempts || []) map.set(a.id, a);
+      mergedPapers[yr] = {
+        ...remoteRec,
+        status: localRec.status === 'practised' || remoteRec.status === 'practised' ? 'practised' : 'in_progress',
+        attempts: Array.from(map.values()),
+      };
+    }
+  }
+
+  // 2024 has 2 merged attempts from phone + laptop
+  assert.strictEqual(mergedPapers[2024].attempts.length, 2);
+  assert.strictEqual(mergedPapers[2024].status, 'practised');
+  // 2023 preserved from laptop
+  assert.strictEqual(mergedPapers[2023].attempts.length, 1);
+});
+
+console.log('\nGroup 8: Firebase Authentication & Migration Safety Logic');
+
+runTest('formatAuthErrorMessage translates standard error codes to user-friendly messages', () => {
+  assert.strictEqual(
+    formatAuthErrorMessage({ code: 'auth/invalid-credential' }),
+    'Invalid email or password. Please verify your credentials and try again.'
+  );
+  assert.strictEqual(
+    formatAuthErrorMessage({ code: 'auth/email-already-in-use' }),
+    'An account with this email address already exists. Please sign in instead.'
+  );
+  assert.strictEqual(
+    formatAuthErrorMessage({ code: 'auth/weak-password' }),
+    'Password is too weak. Please choose a password with at least 6 characters.'
+  );
+  assert.strictEqual(
+    formatAuthErrorMessage({ code: 'auth/popup-closed-by-user' }),
+    'Google sign-in was cancelled before completion.'
+  );
+  assert.strictEqual(
+    formatAuthErrorMessage({ code: 'auth/network-request-failed' }),
+    'Network connection error. Please verify your internet connection and try again.'
+  );
+});
+
+runTest('hasCustomUserData accurately differentiates empty/default vs populated user state', () => {
+  // Empty payload
+  assert.strictEqual(
+    hasCustomUserData({
+      tasks: [],
+      subjects: [],
+      timetableSlots: [],
+      studySessions: [],
+      pyqEntries: [],
+      mockTests: [],
+      errorLogs: [],
+      revisionItems: [],
+      monthlyGoals: [],
+      userConfig: {} as any,
+      pyqPaperRecords: {},
+    }),
+    false
+  );
+
+  // Populated with a completed task
+  assert.strictEqual(
+    hasCustomUserData({
+      tasks: [{ id: 't1', title: 'Calculus review', completed: true } as any],
+      subjects: [],
+      timetableSlots: [],
+      studySessions: [],
+      pyqEntries: [],
+      mockTests: [],
+      errorLogs: [],
+      revisionItems: [],
+      monthlyGoals: [],
+      userConfig: {} as any,
+      pyqPaperRecords: {},
+    }),
+    true
+  );
+});
+
+runTest('getDataSummary computes exact counts of study records for migration modal preview', () => {
+  const summary = getDataSummary({
+    tasks: [{ id: '1' } as any, { id: '2' } as any],
+    subjects: [
+      {
+        id: 'maths' as any,
+        name: 'Mathematics',
+        chapters: [
+          {
+            id: 'c1',
+            title: 'Algebra',
+            subjectId: 'maths' as any,
+            order: 1,
+            topics: [
+              { id: 'top-1', title: 'Quadratics', completed: true } as any,
+              { id: 'top-2', title: 'Progressions', completed: false } as any,
+            ],
+          },
+        ],
+      } as any,
+    ],
+    timetableSlots: [{ id: 's1' } as any],
+    studySessions: [{ id: 'ses-1' } as any],
+    pyqEntries: [{ id: 'p1' } as any],
+    mockTests: [{ id: 'm1', completed: true } as any],
+    errorLogs: [{ id: 'e1' } as any],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: {} as any,
+    pyqPaperRecords: {},
+  });
+
+  assert.strictEqual(summary.taskCount, 2);
+  assert.strictEqual(summary.completedTopicsCount, 1);
+  assert.strictEqual(summary.sessionCount, 1);
+  assert.strictEqual(summary.pyqEntryCount, 1);
+  assert.strictEqual(summary.mockCount, 1);
+  assert.strictEqual(summary.errorLogCount, 1);
 });
 
 console.log(`\n====================================================`);

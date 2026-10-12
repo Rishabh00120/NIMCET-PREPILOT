@@ -14,9 +14,17 @@ import {
   Smartphone,
   Server,
   Key,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  LogIn,
+  LogOut,
+  User,
+  Check,
+  AlertCircle,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { isFirebaseConfigured, setupWebPushSubscription } from '../services/firebase';
+import { setupWebPushSubscription, getPreMigrationBackups } from '../services/firebase';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 
 export const SettingsView: React.FC = () => {
@@ -27,6 +35,16 @@ export const SettingsView: React.FC = () => {
     exportBackupJSON,
     importBackupJSON,
     resetAllData,
+    currentUser,
+    syncStatusState,
+    lastCloudSyncAt,
+    syncErrorMessage,
+    hasPendingOfflineChanges,
+    isFirebaseConfigured,
+    openAuthModal,
+    signOut,
+    forceCloudSync,
+    restorePreMigrationBackupKey,
   } = useApp();
 
   const [exactDateInput, setExactDateInput] = useState(userConfig.exactExamDate || '');
@@ -111,7 +129,258 @@ export const SettingsView: React.FC = () => {
         )}
       </div>
 
-      {/* 2. Exam Date & Study Windows */}
+      {/* 2. Firebase Cloud Account & Cross-Device Synchronization */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-2xs dark:border-slate-800 dark:bg-slate-900 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-4 dark:border-slate-800">
+          <div>
+            <div className="flex items-center gap-2 text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wider">
+              <Cloud className="h-4 w-4" />
+              <span>Cross-Device Cloud Synchronization</span>
+            </div>
+            <h2 className="mt-1 text-base font-bold text-slate-900 dark:text-white">
+              Cloud Account &amp; Firestore Database (Phone &amp; Laptop)
+            </h2>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 max-w-2xl">
+              Sign in with your Google account or email &amp; password to automatically synchronize tasks, syllabus checklists, timetable sessions, PYQ attempts, and mock tests across all your phones and laptops in real-time.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            {currentUser ? (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => forceCloudSync()}
+                  disabled={syncStatusState === 'syncing'}
+                  className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 cursor-pointer disabled:opacity-50"
+                  title="Force immediate cloud sync"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 text-blue-500 ${syncStatusState === 'syncing' ? 'animate-spin' : ''}`} />
+                  <span>Sync Now</span>
+                </button>
+
+                <button
+                  onClick={() => signOut()}
+                  className="flex items-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 hover:bg-rose-100 px-3.5 py-2 text-xs font-semibold text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300 cursor-pointer"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>Sign Out</span>
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => openAuthModal('login')}
+                  disabled={!isFirebaseConfigured}
+                  className="flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 px-4 py-2 text-xs font-bold text-white shadow-xs transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <LogIn className="h-4 w-4" />
+                  <span>Sign In</span>
+                </button>
+                <button
+                  onClick={() => openAuthModal('signup')}
+                  disabled={!isFirebaseConfigured}
+                  className="flex items-center gap-2 rounded-xl border border-blue-500/30 bg-blue-950/40 hover:bg-blue-900/40 px-3.5 py-2 text-xs font-semibold text-blue-300 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <span>Create Account</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Sync Status Diagnostic Cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          {/* Card 1: Account Status */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-950/40">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+              Account Status
+            </span>
+            <div className="flex items-center gap-2">
+              {currentUser?.photoURL ? (
+                <img
+                  src={currentUser.photoURL}
+                  alt="Avatar"
+                  className="h-6 w-6 rounded-full ring-1 ring-blue-500"
+                />
+              ) : (
+                <User className="h-5 w-5 text-slate-400" />
+              )}
+              <div className="truncate">
+                <span className="font-semibold text-slate-900 dark:text-white block truncate">
+                  {currentUser ? currentUser.displayName || currentUser.email || 'Cloud Account' : 'Guest / Local-Only Mode'}
+                </span>
+                <span className="text-[11px] text-slate-500 dark:text-slate-400 block truncate">
+                  {currentUser ? currentUser.email : 'Data saved locally on this browser'}
+                </span>
+              </div>
+            </div>
+            {currentUser && (
+              <div className="mt-2 flex items-center gap-2 pt-2 border-t border-slate-200/50 dark:border-slate-800/80">
+                <span className="rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-blue-400">
+                  {currentUser.providerData?.[0]?.providerId === 'google.com' ? 'Google Sign-In' : 'Email/Password'}
+                </span>
+                <span
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                    currentUser.emailVerified
+                      ? 'bg-emerald-500/10 text-emerald-400'
+                      : 'bg-amber-500/10 text-amber-400'
+                  }`}
+                >
+                  {currentUser.emailVerified ? 'Email Verified' : 'Unverified Email'}
+                </span>
+                {!currentUser.emailVerified && (
+                  <button
+                    onClick={() => openAuthModal('verify_email')}
+                    className="text-[10px] text-blue-400 underline hover:text-blue-300 ml-auto cursor-pointer"
+                  >
+                    Verify
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Card 2: Firestore Sync State */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-950/40">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+              Cloud Database Sync
+            </span>
+            <div className="flex items-center justify-between">
+              <span className="font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
+                {syncStatusState === 'synced' ? (
+                  <Check className="h-4 w-4 text-emerald-500" />
+                ) : syncStatusState === 'syncing' || syncStatusState === 'signing_in' ? (
+                  <RefreshCw className="h-4 w-4 text-blue-500 animate-spin" />
+                ) : syncStatusState === 'error' ? (
+                  <AlertCircle className="h-4 w-4 text-rose-500" />
+                ) : (
+                  <CloudOff className="h-4 w-4 text-slate-400" />
+                )}
+                <span className="capitalize">{syncStatusState.replace('_', ' ')}</span>
+              </span>
+              <span
+                className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold ${
+                  syncStatusState === 'synced'
+                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                    : syncStatusState === 'syncing' || syncStatusState === 'signing_in'
+                    ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'
+                    : syncStatusState === 'error'
+                    ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
+                    : 'bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-300'
+                }`}
+              >
+                {currentUser ? 'Cloud Active' : 'Local Only'}
+              </span>
+            </div>
+            <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+              {lastCloudSyncAt
+                ? `Last synced: ${new Date(lastCloudSyncAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+                : currentUser
+                ? 'Ready for automatic sync'
+                : 'Sign in to sync with your phone or laptop'}
+            </p>
+          </div>
+
+          {/* Card 3: Security & Scope */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-950/40">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+              Data Isolation &amp; Security
+            </span>
+            <div className="flex items-center justify-between">
+              <span className="font-semibold text-slate-900 dark:text-white">
+                {currentUser ? 'User-Scoped' : 'Private Local'}
+              </span>
+              <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                Rule Protected
+              </span>
+            </div>
+            <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+              {currentUser
+                ? `Stored in /users/${currentUser.uid.slice(0, 8)}... (Owner only)`
+                : 'Data remains on this device until you sign in'}
+            </p>
+          </div>
+        </div>
+
+        {/* Offline pending changes banner */}
+        {hasPendingOfflineChanges && (
+          <div className="rounded-xl border border-amber-900/60 bg-amber-950/40 p-3 text-xs text-amber-300 flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-amber-400" />
+            <div>
+              <span className="font-bold">Offline Changes Pending:</span> You have local edits that haven&apos;t been synced to the cloud yet. They will upload automatically once online, or click &quot;Sync Now&quot;.
+            </div>
+          </div>
+        )}
+
+        {/* Error banner if any */}
+        {syncErrorMessage && (
+          <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-3 text-xs text-rose-800 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300 flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-rose-600" />
+            <div>
+              <span className="font-bold">Sync Notice:</span> {syncErrorMessage}
+            </div>
+          </div>
+        )}
+
+        {/* Informational callout regarding Guest Mode vs Cloud Sync */}
+        {!currentUser && (
+          <div className="rounded-xl border border-blue-200/80 bg-blue-50/60 p-3 text-xs text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-blue-300">
+            <span className="font-bold">Guest Mode Notice:</span> Your preparation data is currently saved only in this browser’s IndexedDB/localStorage. Sign in with the same Google or Email account on both your phone and laptop so your study sessions, syllabus progress, timetable, and tasks synchronize automatically.
+          </div>
+        )}
+
+        {/* Pre-Migration Automatic Safety Backups List */}
+        {(() => {
+          const backups = getPreMigrationBackups();
+          if (backups.length === 0) return null;
+          return (
+            <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800">
+              <div className="flex items-center gap-2 mb-2">
+                <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Pre-Migration Safety Backups
+                </span>
+                <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-400 font-mono">
+                  {backups.length} snapshot{backups.length > 1 ? 's' : ''}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-2.5">
+                PrepPilot automatically creates a local safety snapshot before any account sync or migration. You can restore an earlier snapshot at any time:
+              </p>
+              <div className="space-y-1.5">
+                {backups.map((b) => (
+                  <div
+                    key={b.key}
+                    className="flex items-center justify-between rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800/80 px-3 py-2 text-xs"
+                  >
+                    <div>
+                      <span className="font-medium text-slate-800 dark:text-slate-200">
+                        {new Date(b.timestamp).toLocaleString()}
+                      </span>
+                      <span className="ml-2 text-[10px] text-slate-500">
+                        ({b.summary.taskCount} tasks, {b.summary.sessionCount} study logs, {b.summary.pyqEntryCount} PYQs)
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const ok = restorePreMigrationBackupKey(b.key);
+                        if (ok) {
+                          alert('Backup snapshot restored successfully into active session.');
+                        }
+                      }}
+                      className="rounded bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30 px-2 py-0.5 text-[11px] font-semibold cursor-pointer"
+                    >
+                      Restore Snapshot
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* 3. Exam Date & Study Windows */}
       <form onSubmit={handleSaveGeneral} className="rounded-2xl border border-slate-200 bg-white p-6 shadow-2xs dark:border-slate-800 dark:bg-slate-900 space-y-4">
         <h2 className="text-sm font-bold text-slate-900 dark:text-white">
           Examination & Schedule Configuration
@@ -328,20 +597,20 @@ export const SettingsView: React.FC = () => {
             </div>
             <div className="flex items-center justify-between">
               <span className="font-semibold text-slate-900 dark:text-white">
-                {isFirebaseConfigured() ? 'Cloud Configured' : 'Local-First'}
+                {isFirebaseConfigured ? 'Cloud Configured' : 'Local-First'}
               </span>
               <span
                 className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold ${
-                  isFirebaseConfigured()
+                  isFirebaseConfigured
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
                     : 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'
                 }`}
               >
-                {isFirebaseConfigured() ? 'Cloud Ready' : 'Local Mode'}
+                {isFirebaseConfigured ? 'Cloud Ready' : 'Local Mode'}
               </span>
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              {isFirebaseConfigured()
+              {isFirebaseConfigured
                 ? 'Firebase environment credentials detected and verified.'
                 : 'Local-first fallback active; no third-party keys required.'}
             </p>
@@ -380,24 +649,24 @@ export const SettingsView: React.FC = () => {
             </div>
             <div className="flex items-center justify-between">
               <span className="font-semibold text-slate-900 dark:text-white">
-                {isFirebaseConfigured() && userConfig.fcmToken
+                {isFirebaseConfigured && userConfig.fcmToken
                   ? 'Server Dispatch Active'
                   : 'Client-Authoritative Dispatch'}
               </span>
               <span
                 className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold ${
-                  isFirebaseConfigured() && userConfig.fcmToken
+                  isFirebaseConfigured && userConfig.fcmToken
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
                     : 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'
                 }`}
               >
-                {isFirebaseConfigured() && userConfig.fcmToken
+                {isFirebaseConfigured && userConfig.fcmToken
                   ? 'Cloud Messaging'
                   : 'Local PWA Workers'}
               </span>
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              {isFirebaseConfigured() && userConfig.fcmToken
+              {isFirebaseConfigured && userConfig.fcmToken
                 ? 'Backend cloud workers trigger remote push dispatches for upcoming tests & slots.'
                 : 'Service worker and tab timers trigger local scheduled notifications without server dependency.'}
             </p>

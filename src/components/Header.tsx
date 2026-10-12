@@ -1,5 +1,5 @@
 import React from 'react';
-import { Menu, Bell, Play, Calendar as CalendarIcon, Zap } from 'lucide-react';
+import { Menu, Bell, Play, Calendar as CalendarIcon, Zap, Cloud, CloudOff, RefreshCw, LogIn, User } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -32,6 +32,12 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
     daysRemainingUntilExam,
     userConfig,
     setActiveSection,
+    currentUser,
+    syncStatusState,
+    signInWithGoogle,
+    openAuthModal,
+    forceCloudSync,
+    isFirebaseConfigured,
   } = useApp();
 
   const unreadCount = notifications.filter((n) => !n.read && !n.dismissed).length;
@@ -76,8 +82,93 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
         )}
       </div>
 
-      {/* Zone 3: PWA Install, Focus quick button, Notification Bell & Continue Studying */}
+      {/* Zone 3: Sync Status & Auth, PWA Install, Focus quick button, Notification Bell & Continue Studying */}
       <div className="flex items-center gap-2">
+        {/* Cloud Sync Status Indicator */}
+        <button
+          onClick={() => {
+            if (currentUser) {
+              forceCloudSync();
+            } else {
+              openAuthModal('login');
+            }
+          }}
+          className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold border transition-all cursor-pointer ${
+            !isFirebaseConfigured
+              ? 'border-slate-800 bg-slate-900/60 text-slate-400 hover:text-slate-200'
+              : !currentUser
+              ? 'border-amber-900/40 bg-amber-950/30 text-amber-300 hover:bg-amber-900/50'
+              : syncStatusState === 'syncing'
+              ? 'border-blue-800 bg-blue-950/40 text-blue-300'
+              : syncStatusState === 'synced'
+              ? 'border-emerald-800/60 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-900/40'
+              : 'border-rose-800/60 bg-rose-950/30 text-rose-300 hover:bg-rose-900/40'
+          }`}
+          title={
+            !isFirebaseConfigured
+              ? 'Local-First Mode (Firebase unconfigured)'
+              : !currentUser
+              ? 'Guest Mode (Click to Sign In & sync across devices)'
+              : syncStatusState === 'syncing'
+              ? 'Synchronizing changes with Cloud Firestore...'
+              : syncStatusState === 'synced'
+              ? 'Cloud Synchronized with Phone & Laptop (Click to sync now)'
+              : 'Sync Issue (Click to retry)'
+          }
+        >
+          {syncStatusState === 'syncing' ? (
+            <RefreshCw className="h-3.5 w-3.5 animate-spin text-blue-400" />
+          ) : !isFirebaseConfigured || !currentUser ? (
+            <CloudOff className="h-3.5 w-3.5 text-amber-400" />
+          ) : syncStatusState === 'synced' ? (
+            <Cloud className="h-3.5 w-3.5 text-emerald-400" />
+          ) : (
+            <CloudOff className="h-3.5 w-3.5 text-rose-400" />
+          )}
+          <span className="hidden xl:inline text-[11px]">
+            {!isFirebaseConfigured
+              ? 'Local'
+              : !currentUser
+              ? 'Sign In to Sync'
+              : syncStatusState === 'syncing'
+              ? 'Syncing...'
+              : syncStatusState === 'synced'
+              ? 'Synced'
+              : 'Offline'}
+          </span>
+        </button>
+
+        {/* User Profile / Sign In Quick Button */}
+        {currentUser ? (
+          <button
+            onClick={() => setActiveSection('settings')}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/80 px-2 py-1 text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+            title={`Signed in as ${currentUser.email || currentUser.displayName || 'Google User'}`}
+          >
+            {currentUser.photoURL ? (
+              <img
+                src={currentUser.photoURL}
+                alt="Profile"
+                className="h-5 w-5 rounded-full ring-1 ring-blue-500"
+              />
+            ) : (
+              <User className="h-3.5 w-3.5 text-blue-400" />
+            )}
+            <span className="hidden md:inline text-[11px] font-medium max-w-[90px] truncate">
+              {currentUser.displayName?.split(' ')[0] || 'Account'}
+            </span>
+          </button>
+        ) : (
+          <button
+            onClick={() => openAuthModal('login')}
+            className="hidden sm:flex items-center gap-1.5 rounded-lg border border-blue-800/60 bg-blue-950/40 px-2.5 py-1.5 text-xs font-semibold text-blue-300 hover:bg-blue-900/60 transition-colors cursor-pointer"
+            title="Sign in to sync between phone and laptop"
+          >
+            <LogIn className="h-3.5 w-3.5 text-blue-400" />
+            <span>Sign In</span>
+          </button>
+        )}
+
         <PWAInstallButton />
 
         <button
