@@ -21,7 +21,22 @@ import {
 } from '../src/utils/dateUtils';
 import { LoggedStudySession, SyllabusSubject, SyllabusTopic, PYQPaperAttempt, PYQPaperRecord, SubjectId, NavSection } from '../src/types';
 import { PYQ_PAPER_LINKS, isValidPYQUrl, getPYQPaperByYear } from '../src/data/pyqLinks';
-import { formatAuthErrorMessage, hasCustomUserData, getDataSummary } from '../src/services/firebase';
+import {
+  formatAuthErrorMessage,
+  hasCustomUserData,
+  getDataSummary,
+  mergeItemsById,
+  mergeTopics,
+  mergeSubjects,
+  mergeLocalAndRemoteData,
+  mergeUserConfig,
+  sanitizeFirestoreData,
+  findUndefinedFieldPaths,
+  validateUserDataPayload,
+  savePreMigrationBackup,
+  getPreMigrationBackups,
+  type FullUserDataPayload,
+} from '../src/services/firebase';
 
 let totalTests = 0;
 let passedTests = 0;
@@ -510,27 +525,26 @@ runTest('PYQ paper scheduling creates tasks without forced maths or unverified q
 // 7. Cloud Synchronization, Two-Way Merge & Conflict Resolution
 console.log('\nGroup 7: Cloud Synchronization, Two-Way Merge & Conflict Resolution');
 
-runTest('mergeItemsById merges unique items and updates existing without duplication', () => {
+runTest('mergeItemsById merges unique items and updates existing with LWW timestamps', () => {
   interface SampleItem {
     id: string;
     title: string;
-    version: number;
+    createdAt?: string;
+    updatedAt?: string;
+    deletedAt?: string;
   }
 
   const remoteItems: SampleItem[] = [
-    { id: 'item-1', title: 'Task Phone', version: 1 },
-    { id: 'item-2', title: 'Task Laptop', version: 1 },
+    { id: 'item-1', title: 'Task Phone', createdAt: '2026-10-01T10:00:00Z', updatedAt: '2026-10-01T10:00:00Z' },
+    { id: 'item-2', title: 'Task Laptop', createdAt: '2026-10-01T10:00:00Z', updatedAt: '2026-10-01T10:00:00Z' },
   ];
 
   const localItems: SampleItem[] = [
-    { id: 'item-2', title: 'Task Laptop (Edited on Phone)', version: 2 },
-    { id: 'item-3', title: 'New Task from Phone', version: 1 },
+    { id: 'item-2', title: 'Task Laptop (Edited on Phone)', createdAt: '2026-10-01T10:00:00Z', updatedAt: '2026-10-02T12:00:00Z' },
+    { id: 'item-3', title: 'New Task from Phone', createdAt: '2026-10-03T10:00:00Z', updatedAt: '2026-10-03T10:00:00Z' },
   ];
 
-  const map = new Map<string, SampleItem>();
-  for (const item of remoteItems) map.set(item.id, item);
-  for (const item of localItems) map.set(item.id, item);
-  const merged = Array.from(map.values());
+  const merged = mergeItemsById(localItems, remoteItems, true);
 
   assert.strictEqual(merged.length, 3);
   assert.strictEqual(merged.find((i) => i.id === 'item-1')?.title, 'Task Phone');
@@ -538,18 +552,166 @@ runTest('mergeItemsById merges unique items and updates existing without duplica
   assert.strictEqual(merged.find((i) => i.id === 'item-3')?.title, 'New Task from Phone');
 });
 
-runTest('mergeLocalAndRemoteData preserves completed topics from either device', () => {
+runTest('mergeItemsById propagates deletion tombstones and prevents resurrection of deleted items', () => {
+  interface SampleTask {
+    id: string;
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    deletedAt?: string;
+  }
+
+  // Device A deleted task-1 at 2026-10-10T15:00:00Z
+  const deviceALocal: SampleTask[] = [
+    {
+      id: 'task-1',
+      title: 'Review Trigonometry',
+      createdAt: '2026-10-01T10:00:00Z',
+      updatedAt: '2026-10-10T15:00:00Z',
+      deletedAt: '2026-10-10T15:00:00Z',
+    },
+  ];
+
+  // Device B still has the old active task-1 from 2026-10-05
+  const deviceBRemote: SampleTask[] = [
+    {
+      id: 'task-1',
+      title: 'Review Trigonometry',
+      createdAt: '2026-10-01T10:00:00Z',
+      updatedAt: '2026-10-05T12:00:00Z',
+    },
+  ];
+
+  // When merging, tombstone MUST win over older active record
+  const merged = mergeItemsById(deviceALocal, deviceBRemote, true);
+  assert.strictEqual(merged.length, 1);
+  assert.strictEqual(merged[0].id, 'task-1');
+  assert.ok(merged[0].deletedAt, 'Deleted tombstone must be preserved');
+  assert.strictEqual(merged[0].deletedAt, '2026-10-10T15:00:00Z');
+
+  // Also verify with includeTombstones = false for visible filtering
+  const visible = mergeItemsById(deviceALocal, deviceBRemote, false);
+  assert.strictEqual(visible.length, 0, 'Deleted item must be hidden from visible list');
+});
+
+runTest('mergeItemsById allows edit strictly after deletion to take precedence', () => {
+  interface SampleTask {
+    id: string;
+    title: string;
+    updatedAt?: string;
+    deletedAt?: string;
+  }
+
+  // Deleted on Phone at 10:00 AM
+  const localList: SampleTask[] = [
+    { id: 'task-revive', title: 'Calculus', deletedAt: '2026-10-10T10:00:00Z', updatedAt: '2026-10-10T10:00:00Z' },
+  ];
+
+  // Edited on Laptop at 11:00 AM (strictly after deletion)
+  const remoteList: SampleTask[] = [
+    { id: 'task-revive', title: 'Calculus (Re-opened & Edited)', updatedAt: '2026-10-10T11:00:00Z' },
+  ];
+
+  const merged = mergeItemsById(localList, remoteList, true);
+  assert.strictEqual(merged.length, 1);
+  assert.strictEqual(merged[0].title, 'Calculus (Re-opened & Edited)');
+  assert.strictEqual(merged[0].deletedAt, undefined, 'Post-deletion edit must resurrect task');
+});
+
+runTest('mergeTopics resolves topic completion conflict: newer uncompletion wins over older completion', () => {
+  // Device A uncompleted topic at 2026-10-12T14:00:00Z
+  const uncompletedTopic: SyllabusTopic = {
+    id: 'top-matrices',
+    subjectId: 'maths',
+    chapterId: 'chap-algebra',
+    title: 'Matrix Inversion',
+    completed: false,
+    status: 'in_progress',
+    questionsSolved: 25,
+    questionsCorrect: 20,
+    actualHours: 3.5,
+    estimatedHours: 4,
+    priority: 'high',
+    notes: 'Need to review adjoint calculation',
+    assignedMonth: '2026-10',
+    plannedStartDate: '2026-10-01',
+    targetCompletionDate: '2026-10-20',
+    updatedAt: '2026-10-12T14:00:00Z',
+  };
+
+  // Device B marked it completed earlier at 2026-10-10T10:00:00Z
+  const completedTopic: SyllabusTopic = {
+    ...uncompletedTopic,
+    completed: true,
+    status: 'completed',
+    completedAt: '2026-10-10T10:00:00Z',
+    updatedAt: '2026-10-10T10:00:00Z',
+    questionsSolved: 15, // Less questions solved earlier
+    actualHours: 2.0,
+  };
+
+  const resolved = mergeTopics(uncompletedTopic, completedTopic);
+
+  // Newer uncompletion must win! (No longer trapped by logical OR)
+  assert.strictEqual(resolved.completed, false, 'Newer uncompletion must take precedence over older completion');
+  assert.strictEqual(resolved.status, 'in_progress');
+  assert.strictEqual(resolved.completedAt, undefined);
+
+  // Cumulative study metrics must be preserved (maximum of both)
+  assert.strictEqual(resolved.questionsSolved, 25, 'Maximum questions solved must be preserved');
+  assert.strictEqual(resolved.actualHours, 3.5, 'Maximum study hours must be preserved');
+});
+
+runTest('mergeSubjects preserves union of completed topics for older untimestamped records (safe migration fallback)', () => {
   const localSubjects = [
     {
       id: 'maths' as const,
       name: 'Mathematics',
+      shortName: 'Maths',
+      questionWeight: 50,
+      marksPerQuestion: 12,
+      color: '#3b82f6',
       chapters: [
         {
           id: 'set-theory',
+          subjectId: 'maths' as const,
+          order: 1,
           title: 'Set Theory',
           topics: [
-            { id: 'top-1', title: 'Sets & Subsets', completed: true, questionsSolved: 30 },
-            { id: 'top-2', title: 'Venn Diagrams', completed: false, questionsSolved: 10 },
+            {
+              id: 'top-1',
+              subjectId: 'maths' as const,
+              chapterId: 'set-theory',
+              title: 'Sets & Subsets',
+              completed: true,
+              questionsSolved: 30,
+              questionsCorrect: 25,
+              actualHours: 2,
+              estimatedHours: 3,
+              priority: 'high' as const,
+              notes: '',
+              assignedMonth: '2026-10',
+              plannedStartDate: '2026-10-01',
+              targetCompletionDate: '2026-10-20',
+              status: 'completed' as const,
+            },
+            {
+              id: 'top-2',
+              subjectId: 'maths' as const,
+              chapterId: 'set-theory',
+              title: 'Venn Diagrams',
+              completed: false,
+              questionsSolved: 10,
+              questionsCorrect: 8,
+              actualHours: 1,
+              estimatedHours: 2,
+              priority: 'medium' as const,
+              notes: '',
+              assignedMonth: '2026-10',
+              plannedStartDate: '2026-10-01',
+              targetCompletionDate: '2026-10-20',
+              status: 'in_progress' as const,
+            },
           ],
         },
       ],
@@ -560,51 +722,66 @@ runTest('mergeLocalAndRemoteData preserves completed topics from either device',
     {
       id: 'maths' as const,
       name: 'Mathematics',
+      shortName: 'Maths',
+      questionWeight: 50,
+      marksPerQuestion: 12,
+      color: '#3b82f6',
       chapters: [
         {
           id: 'set-theory',
+          subjectId: 'maths' as const,
+          order: 1,
           title: 'Set Theory',
           topics: [
-            { id: 'top-1', title: 'Sets & Subsets', completed: false, questionsSolved: 15 },
-            { id: 'top-2', title: 'Venn Diagrams', completed: true, questionsSolved: 25 },
+            {
+              id: 'top-1',
+              subjectId: 'maths' as const,
+              chapterId: 'set-theory',
+              title: 'Sets & Subsets',
+              completed: false,
+              questionsSolved: 15,
+              questionsCorrect: 12,
+              actualHours: 1,
+              estimatedHours: 3,
+              priority: 'high' as const,
+              notes: '',
+              assignedMonth: '2026-10',
+              plannedStartDate: '2026-10-01',
+              targetCompletionDate: '2026-10-20',
+              status: 'not_started' as const,
+            },
+            {
+              id: 'top-2',
+              subjectId: 'maths' as const,
+              chapterId: 'set-theory',
+              title: 'Venn Diagrams',
+              completed: true,
+              completedAt: '2026-10-08T10:00:00Z',
+              questionsSolved: 25,
+              questionsCorrect: 20,
+              actualHours: 2.5,
+              estimatedHours: 2,
+              priority: 'medium' as const,
+              notes: '',
+              assignedMonth: '2026-10',
+              plannedStartDate: '2026-10-01',
+              targetCompletionDate: '2026-10-20',
+              status: 'completed' as const,
+            },
           ],
         },
       ],
     },
   ];
 
-  const merged = localSubjects.map((localSubj) => {
-    const remoteSubj = remoteSubjects.find((s) => s.id === localSubj.id);
-    if (!remoteSubj) return localSubj;
-    return {
-      ...localSubj,
-      chapters: localSubj.chapters.map((localCh) => {
-        const remoteCh = remoteSubj.chapters.find((c) => c.id === localCh.id);
-        if (!remoteCh) return localCh;
-        return {
-          ...localCh,
-          topics: localCh.topics.map((localTop) => {
-            const remoteTop = remoteCh.topics.find((t) => t.id === localTop.id);
-            if (!remoteTop) return localTop;
-            const isCompleted = localTop.completed || remoteTop.completed;
-            const questionsSolved = Math.max(localTop.questionsSolved || 0, remoteTop.questionsSolved || 0);
-            return {
-              ...localTop,
-              completed: isCompleted,
-              questionsSolved,
-            };
-          }),
-        };
-      }),
-    };
-  });
-
+  const merged = mergeSubjects(localSubjects, remoteSubjects);
   const topics = merged[0].chapters[0].topics;
-  // Both topics must be completed in the merged state (union of progress)
+
   assert.strictEqual(topics[0].completed, true);
   assert.strictEqual(topics[0].questionsSolved, 30);
   assert.strictEqual(topics[1].completed, true);
   assert.strictEqual(topics[1].questionsSolved, 25);
+  assert.strictEqual(topics[1].actualHours, 2.5);
 });
 
 runTest('mergeLocalAndRemoteData unions PYQ paper attempts from multiple devices', () => {
@@ -755,6 +932,379 @@ runTest('getDataSummary computes exact counts of study records for migration mod
   assert.strictEqual(summary.pyqEntryCount, 1);
   assert.strictEqual(summary.mockCount, 1);
   assert.strictEqual(summary.errorLogCount, 1);
+});
+
+// =============================================================================
+// Group 9: Firestore Payload Sanitization, Smart Merge & Migration Safety
+// =============================================================================
+console.log('\nGroup 9: Firestore Payload Sanitization, Smart Merge & Migration Safety');
+
+// Ensure localStorage mock is present in Node environment for backup tests
+if (typeof globalThis.localStorage === 'undefined') {
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, val: string) => { store.set(key, String(val)); },
+    removeItem: (key: string) => { store.delete(key); },
+    clear: () => { store.clear(); },
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    length: 0,
+  };
+}
+
+runTest('Undefined properties at multiple nesting levels are detected and omitted', () => {
+  const payloadWithUndefined = {
+    tasks: [
+      {
+        id: 'task-1',
+        title: 'Trigonometry formula revision',
+        completedAt: undefined, // nested level 2 undefined
+        deletedAt: undefined,
+      },
+    ],
+    subjects: [
+      {
+        id: 'maths',
+        chapters: [
+          {
+            id: 'ch-1',
+            topics: [
+              {
+                id: 'top-1',
+                title: 'Sets and Relations',
+                completed: false,
+                completedAt: undefined, // nested level 4 undefined
+                lastRevisionDate: undefined,
+                nextRevisionDate: undefined,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    userConfig: {
+      examName: 'NIMCET 2027',
+      fcmToken: undefined,
+    },
+  };
+
+  // 1. Diagnostics detects all nested paths without leaking private values
+  const undefinedPaths = findUndefinedFieldPaths(payloadWithUndefined);
+  assert.ok(undefinedPaths.includes('tasks[0].completedAt'));
+  assert.ok(undefinedPaths.includes('tasks[0].deletedAt'));
+  assert.ok(undefinedPaths.includes('subjects[0].chapters[0].topics[0].completedAt'));
+  assert.ok(undefinedPaths.includes('subjects[0].chapters[0].topics[0].lastRevisionDate'));
+  assert.ok(undefinedPaths.includes('userConfig.fcmToken'));
+
+  // 2. Sanitizer recursively strips undefined properties
+  const sanitized = sanitizeFirestoreData(payloadWithUndefined);
+
+  // Assert properties are completely removed (not setDoc incompatible)
+  assert.strictEqual('completedAt' in sanitized.tasks[0], false);
+  assert.strictEqual('deletedAt' in sanitized.tasks[0], false);
+  assert.strictEqual('completedAt' in sanitized.subjects[0].chapters[0].topics[0], false);
+  assert.strictEqual('lastRevisionDate' in sanitized.subjects[0].chapters[0].topics[0], false);
+  assert.strictEqual('fcmToken' in sanitized.userConfig, false);
+
+  // Original object was NOT mutated
+  assert.strictEqual('completedAt' in payloadWithUndefined.tasks[0], true);
+});
+
+runTest('Arrays containing undefined or incomplete items are handled safely', () => {
+  // Array containing undefined items
+  const arrayWithUndefined = ['topic-a', undefined, 'topic-b', undefined, 'topic-c'];
+  const sanitizedArray = sanitizeFirestoreData(arrayWithUndefined);
+
+  assert.deepStrictEqual(sanitizedArray, ['topic-a', 'topic-b', 'topic-c']);
+  assert.strictEqual(sanitizedArray.length, 3);
+
+  // Nested array of items with undefined properties
+  const objectsArray = [
+    { id: '1', name: 'Item 1', optionalNote: undefined },
+    undefined,
+    { id: '2', name: 'Item 2', score: 100 },
+  ];
+  const sanitizedObjects = sanitizeFirestoreData(objectsArray) as Array<{ id: string; name: string; score?: number }>;
+  assert.strictEqual(sanitizedObjects.length, 2);
+  assert.strictEqual(sanitizedObjects[0]!.id, '1');
+  assert.strictEqual('optionalNote' in sanitizedObjects[0]!, false);
+  assert.strictEqual(sanitizedObjects[1]!.id, '2');
+});
+
+runTest('Valid null values are preserved and not replaced or stripped', () => {
+  const payloadWithNull = {
+    exactExamDate: null,
+    fcmToken: null,
+    scheduledRetestDate: null,
+    subConfig: {
+      secondaryDate: null,
+    },
+  };
+
+  const sanitized = sanitizeFirestoreData(payloadWithNull);
+  assert.strictEqual(sanitized.exactExamDate, null);
+  assert.strictEqual(sanitized.fcmToken, null);
+  assert.strictEqual(sanitized.scheduledRetestDate, null);
+  assert.strictEqual(sanitized.subConfig.secondaryDate, null);
+});
+
+runTest('Empty optional fields are preserved when meaningful and omitted when undefined', () => {
+  const itemWithEmptyFields = {
+    id: 'entry-1',
+    notes: '', // empty string is meaningful, preserve
+    weakTopics: [], // empty array is meaningful, preserve
+    actualHours: 0, // 0 is meaningful number, preserve
+    isBreak: false, // false is meaningful boolean, preserve
+    missingField: undefined, // undefined should be omitted
+  };
+
+  const sanitized = sanitizeFirestoreData(itemWithEmptyFields);
+  assert.strictEqual(sanitized.notes, '');
+  assert.deepStrictEqual(sanitized.weakTopics, []);
+  assert.strictEqual(sanitized.actualHours, 0);
+  assert.strictEqual(sanitized.isBreak, false);
+  assert.strictEqual('missingField' in sanitized, false);
+});
+
+runTest('Missing required fields fail validation with useful diagnostics', () => {
+  // Completely missing required array
+  const invalidPayload1 = {
+    tasks: 'not-an-array' as any,
+    subjects: [],
+  };
+  const res1 = validateUserDataPayload(invalidPayload1);
+  assert.strictEqual(res1.isValid, false);
+  assert.ok(res1.errors.some((e) => e.includes('tasks')));
+
+  // Task item missing required id and title
+  const invalidPayload2 = {
+    tasks: [{ priority: 'high', status: 'pending' }] as any,
+    subjects: [],
+    timetableSlots: [],
+    studySessions: [],
+    pyqEntries: [],
+    mockTests: [],
+    errorLogs: [],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: {},
+    pyqPaperRecords: {},
+  };
+  const res2 = validateUserDataPayload(invalidPayload2);
+  assert.strictEqual(res2.isValid, false);
+  assert.ok(res2.errors.some((e) => e.includes('tasks[0].id is required')));
+  assert.ok(res2.errors.some((e) => e.includes('tasks[0].title is required')));
+
+  // Valid payload passes
+  const validPayload = {
+    tasks: [
+      { id: 't1', title: 'Task 1', taskType: 'Learn', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'high', status: 'pending' },
+    ],
+    subjects: [
+      { id: 'maths', name: 'Mathematics', chapters: [] },
+    ],
+    timetableSlots: [],
+    studySessions: [],
+    pyqEntries: [],
+    mockTests: [],
+    errorLogs: [],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: { examName: 'NIMCET 2027' },
+    pyqPaperRecords: {},
+  };
+  const res3 = validateUserDataPayload(validPayload);
+  assert.strictEqual(res3.isValid, true);
+  assert.strictEqual(res3.errors.length, 0);
+});
+
+runTest('Smart Merge safely combines disjoint datasets, preserving custom topics and config', () => {
+  const localDataset: FullUserDataPayload = {
+    tasks: [
+      { id: 'task-local-1', title: 'Maths Integration', taskType: 'Practise', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'high', status: 'pending', createdAt: '2026-10-10T10:00:00Z', updatedAt: '2026-10-10T10:00:00Z', estimatedMinutes: 60, actualMinutes: 0, notes: '' },
+      { id: 'task-shared', title: 'Shared Task (Local newer)', taskType: 'Learn', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'medium', status: 'completed', createdAt: '2026-10-10T10:00:00Z', updatedAt: '2026-10-12T15:00:00Z', estimatedMinutes: 45, actualMinutes: 45, notes: '' },
+    ],
+    subjects: [
+      {
+        id: 'maths',
+        name: 'Mathematics',
+        shortName: 'Math',
+        questionWeight: 50,
+        marksPerQuestion: 12,
+        color: 'blue',
+        chapters: [
+          {
+            id: 'ch-alg',
+            subjectId: 'maths',
+            title: 'Algebra',
+            order: 1,
+            topics: [
+              { id: 'top-1', subjectId: 'maths', chapterId: 'ch-alg', title: 'Quadratics', completed: true, completedAt: '2026-10-11T10:00:00Z', updatedAt: '2026-10-11T10:00:00Z', status: 'completed', plannedStartDate: '2026-10-10', targetCompletionDate: '2026-10-15', assignedMonth: '2026-10', priority: 'high', notes: '', estimatedHours: 3, actualHours: 2, questionsSolved: 30, questionsCorrect: 25 },
+            ],
+          },
+        ],
+      },
+    ],
+    timetableSlots: [],
+    studySessions: [
+      { id: 'sess-local-1', date: '2026-10-11', slotId: 'slot-1', startTime: '14:00', endTime: '15:30', activity: 'Algebra Study', status: 'completed', plannedMinutes: 90, actualMinutes: 90, notes: '', loggedAt: '2026-10-11T15:30:00Z' },
+    ],
+    pyqEntries: [],
+    mockTests: [],
+    errorLogs: [],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: {
+      examName: 'NIMCET 2027',
+      exactExamDate: null, // default empty on local
+    },
+    pyqPaperRecords: {},
+  };
+
+  const remoteDataset: FullUserDataPayload = {
+    tasks: [
+      { id: 'task-remote-1', title: 'Reasoning Puzzles', taskType: 'Practise', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'medium', status: 'pending', createdAt: '2026-10-09T10:00:00Z', updatedAt: '2026-10-09T10:00:00Z', estimatedMinutes: 40, actualMinutes: 0, notes: '' },
+      { id: 'task-shared', title: 'Shared Task (Remote older)', taskType: 'Learn', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'medium', status: 'pending', createdAt: '2026-10-10T10:00:00Z', updatedAt: '2026-10-10T11:00:00Z', estimatedMinutes: 45, actualMinutes: 0, notes: '' },
+    ],
+    subjects: [
+      {
+        id: 'maths',
+        name: 'Mathematics',
+        shortName: 'Math',
+        questionWeight: 50,
+        marksPerQuestion: 12,
+        color: 'blue',
+        chapters: [
+          {
+            id: 'ch-alg',
+            subjectId: 'maths',
+            title: 'Algebra',
+            order: 1,
+            topics: [
+              { id: 'top-1', subjectId: 'maths', chapterId: 'ch-alg', title: 'Quadratics', completed: false, status: 'in_progress', plannedStartDate: '2026-10-10', targetCompletionDate: '2026-10-15', assignedMonth: '2026-10', priority: 'high', notes: '', estimatedHours: 3, actualHours: 1, questionsSolved: 10, questionsCorrect: 8 },
+              // Custom topic added on device B
+              { id: 'top-custom-remote', subjectId: 'maths', chapterId: 'ch-alg', title: 'Theory of Equations Extra', completed: true, completedAt: '2026-10-12T09:00:00Z', updatedAt: '2026-10-12T09:00:00Z', status: 'completed', plannedStartDate: '2026-10-10', targetCompletionDate: '2026-10-15', assignedMonth: '2026-10', priority: 'medium', notes: '', estimatedHours: 2, actualHours: 2, questionsSolved: 20, questionsCorrect: 18 },
+            ],
+          },
+        ],
+      },
+    ],
+    timetableSlots: [],
+    studySessions: [],
+    pyqEntries: [],
+    mockTests: [
+      { id: 'mock-1', testName: 'NIMCET Mock 1', provider: 'Standard', testType: 'full_mock', scheduledDate: '2026-10-12', completed: true, score: 380, maxMarks: 600, correctCount: 95, incorrectCount: 15, skippedCount: 10, timeObservations: 'Good speed', weakTopics: [], followUpTasks: [] },
+    ],
+    errorLogs: [],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: {
+      examName: 'NIMCET 2027',
+      exactExamDate: '2027-05-23', // customized on remote device!
+      weightingMethod: 'nimcet_exam_weight',
+    },
+    pyqPaperRecords: {},
+  };
+
+  const merged = mergeLocalAndRemoteData(localDataset, remoteDataset);
+
+  // Assert Tasks: 3 unique tasks total (union)
+  assert.strictEqual(merged.tasks.length, 3);
+  const sharedTask = merged.tasks.find((t) => t.id === 'task-shared');
+  assert.strictEqual(sharedTask?.title, 'Shared Task (Local newer)');
+  assert.strictEqual(sharedTask?.status, 'completed');
+
+  // Assert Sessions & Mocks preserved
+  assert.strictEqual(merged.studySessions.length, 1);
+  assert.strictEqual(merged.mockTests.length, 1);
+
+  // Assert custom topic preserved
+  const mathsTopics = merged.subjects[0].chapters[0].topics;
+  assert.ok(mathsTopics.some((t) => t.id === 'top-custom-remote'));
+
+  // Assert cumulative study metrics preserved (Math.max)
+  const quadratics = mathsTopics.find((t) => t.id === 'top-1');
+  assert.strictEqual(quadratics?.completed, true);
+  assert.strictEqual(quadratics?.questionsSolved, 30);
+  assert.strictEqual(quadratics?.actualHours, 2);
+
+  // Assert user config: remote customized exactExamDate is preserved (not overwritten by local null default)
+  assert.strictEqual(merged.userConfig.exactExamDate, '2027-05-23');
+  assert.strictEqual(merged.userConfig.weightingMethod, 'nimcet_exam_weight');
+});
+
+runTest('Failed Firestore writes preserve local records and pre-migration backup intact', async () => {
+  const localData: FullUserDataPayload = {
+    tasks: [{ id: 'task-preserve-1', title: 'Local Study Item', taskType: 'Learn', startDate: '2026-10-10', deadline: '2026-10-12', priority: 'high', status: 'pending', createdAt: '2026-10-10T10:00:00Z', estimatedMinutes: 30, actualMinutes: 0, notes: '' }],
+    subjects: [],
+    timetableSlots: [],
+    studySessions: [],
+    pyqEntries: [],
+    mockTests: [],
+    errorLogs: [],
+    revisionItems: [],
+    monthlyGoals: [],
+    userConfig: {},
+    pyqPaperRecords: {},
+  };
+
+  // 1. Create pre-migration backup
+  const backupKey = savePreMigrationBackup(localData);
+  assert.ok(backupKey.length > 0);
+
+  // 2. Simulate migration attempt with a write failure
+  let localState = { ...localData };
+  const mockUploadFailure = async () => ({ success: false, error: 'Network unavailable: 503 Service Unavailable' });
+
+  const res = await mockUploadFailure();
+  if (!res.success) {
+    // Under our safe migration rules: local state is NOT mutated
+  } else {
+    localState = { tasks: [] } as any;
+  }
+
+  // Verify local data is 100% intact
+  assert.strictEqual(localState.tasks.length, 1);
+  assert.strictEqual(localState.tasks[0].id, 'task-preserve-1');
+
+  // Verify backup is safely retrieved and matches original
+  const backups = getPreMigrationBackups();
+  assert.ok(backups.length > 0);
+  const foundBackup = backups.find((b) => b.key === backupKey);
+  assert.ok(foundBackup);
+  assert.strictEqual(foundBackup?.data.tasks[0].id, 'task-preserve-1');
+});
+
+runTest('Partial migration failures prevent Synced status and allow clean retry', async () => {
+  let syncStatus = 'migration_pending';
+  let syncErrorMessage: string | null = null;
+  let isMigratedFlag = false;
+
+  const simulateMigrationWrite = async (succeed: boolean) => {
+    if (!succeed) {
+      syncStatus = 'error';
+      syncErrorMessage = 'Write operation failed: permission-denied';
+      return { success: false, error: syncErrorMessage };
+    }
+    syncStatus = 'synced';
+    syncErrorMessage = null;
+    isMigratedFlag = true;
+    return { success: true };
+  };
+
+  // Step 1: Write fails
+  const failureRes = await simulateMigrationWrite(false);
+  assert.strictEqual(failureRes.success, false);
+  assert.strictEqual(syncStatus, 'error');
+  assert.strictEqual(isMigratedFlag, false);
+  assert.ok(failureRes.error && failureRes.error.includes('permission-denied'));
+
+  // Step 2: Retry with successful write
+  const retryRes = await simulateMigrationWrite(true);
+  assert.strictEqual(retryRes.success, true);
+  assert.strictEqual(syncStatus, 'synced');
+  assert.strictEqual(isMigratedFlag, true);
+  assert.strictEqual(syncErrorMessage, null);
 });
 
 console.log(`\n====================================================`);

@@ -100,6 +100,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
               ? 'border-amber-900/40 bg-amber-950/30 text-amber-300 hover:bg-amber-900/50'
               : syncStatusState === 'syncing'
               ? 'border-blue-800 bg-blue-950/40 text-blue-300'
+              : syncStatusState === 'migration_pending'
+              ? 'border-amber-800/60 bg-amber-950/40 text-amber-300 hover:bg-amber-900/50'
               : syncStatusState === 'synced'
               ? 'border-emerald-800/60 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-900/40'
               : 'border-rose-800/60 bg-rose-950/30 text-rose-300 hover:bg-rose-900/40'
@@ -111,6 +113,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
               ? 'Guest Mode (Click to Sign In & sync across devices)'
               : syncStatusState === 'syncing'
               ? 'Synchronizing changes with Cloud Firestore...'
+              : syncStatusState === 'migration_pending'
+              ? 'Data Migration Review Required (Click to review)'
               : syncStatusState === 'synced'
               ? 'Cloud Synchronized with Phone & Laptop (Click to sync now)'
               : 'Sync Issue (Click to retry)'
@@ -118,6 +122,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
         >
           {syncStatusState === 'syncing' ? (
             <RefreshCw className="h-3.5 w-3.5 animate-spin text-blue-400" />
+          ) : syncStatusState === 'migration_pending' ? (
+            <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
           ) : !isFirebaseConfigured || !currentUser ? (
             <CloudOff className="h-3.5 w-3.5 text-amber-400" />
           ) : syncStatusState === 'synced' ? (
@@ -132,6 +138,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar, onOpenNotificat
               ? 'Sign In to Sync'
               : syncStatusState === 'syncing'
               ? 'Syncing...'
+              : syncStatusState === 'migration_pending'
+              ? 'Review Sync'
               : syncStatusState === 'synced'
               ? 'Synced'
               : 'Offline'}

@@ -44,7 +44,21 @@ self.addEventListener('push', (event: PushEvent) => {
   try {
     const payload = event.data.json();
     const notificationTitle =
-      payload.notification?.title || payload.title || 'PrepPilot &bull; NIMCET 2027';
+      payload.notification?.title || payload.title || 'PrepPilot • NIMCET 2027';
+
+    // Deduplication tag prevents stacking duplicate notifications for the same event
+    const tag =
+      payload.tag ||
+      payload.data?.tag ||
+      payload.notification?.tag ||
+      'preppilot-study-reminder';
+
+    const targetUrl =
+      payload.data?.url ||
+      payload.data?.targetUrl ||
+      payload.url ||
+      payload.data?.actionUrl ||
+      '/';
 
     const notificationOptions: NotificationOptions = {
       body:
@@ -53,8 +67,11 @@ self.addEventListener('push', (event: PushEvent) => {
         'You have an upcoming study milestone or revision scheduled.',
       icon: '/pwa-192x192.png',
       badge: '/pwa-192x192.png',
-      data: payload.data || { url: '/' },
-      tag: payload.tag || 'preppilot-study-reminder',
+      data: {
+        ...(payload.data || {}),
+        url: targetUrl,
+      },
+      tag,
     };
 
     event.waitUntil(self.registration.showNotification(notificationTitle, notificationOptions));
@@ -62,9 +79,11 @@ self.addEventListener('push', (event: PushEvent) => {
     console.warn('[sw.ts] Could not parse push payload:', err);
     // Plaintext fallback
     event.waitUntil(
-      self.registration.showNotification('PrepPilot &bull; Study Reminder', {
+      self.registration.showNotification('PrepPilot • Study Reminder', {
         body: event.data.text() || 'Keep your NIMCET 2027 streak alive today.',
         icon: '/pwa-192x192.png',
+        tag: 'preppilot-study-reminder',
+        data: { url: '/' },
       })
     );
   }
@@ -73,7 +92,11 @@ self.addEventListener('push', (event: PushEvent) => {
 // Notification Click Handler: Focus existing tab or open target URL
 self.addEventListener('notificationclick', (event: NotificationEvent) => {
   event.notification.close();
-  const rawTarget = event.notification.data?.url || '/';
+  const rawTarget =
+    event.notification.data?.url ||
+    event.notification.data?.targetUrl ||
+    event.notification.data?.actionUrl ||
+    '/';
   const targetUrl = new URL(rawTarget, self.location.origin).href;
 
   event.waitUntil(

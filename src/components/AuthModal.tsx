@@ -233,7 +233,7 @@ export const AuthModal: React.FC = () => {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 lg:p-6 bg-slate-950/85 backdrop-blur-md overflow-y-auto auth-modal-scroll"
+      className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-4 lg:p-6 bg-slate-950/85 backdrop-blur-md overflow-hidden"
       onClick={(e) => {
         if (e.target === e.currentTarget) closeAuthModal();
       }}
@@ -401,6 +401,8 @@ export const AuthModal: React.FC = () => {
                           ? 'bg-emerald-400'
                           : syncStatusState === 'syncing' || syncStatusState === 'signing_in'
                           ? 'bg-blue-400 animate-pulse'
+                          : syncStatusState === 'migration_pending'
+                          ? 'bg-amber-400 animate-pulse'
                           : syncStatusState === 'error'
                           ? 'bg-rose-400'
                           : 'bg-slate-500'
@@ -414,6 +416,8 @@ export const AuthModal: React.FC = () => {
                           ? 'text-emerald-400 font-semibold'
                           : syncStatusState === 'syncing' || syncStatusState === 'signing_in'
                           ? 'text-blue-400'
+                          : syncStatusState === 'migration_pending'
+                          ? 'text-amber-400 font-semibold'
                           : syncStatusState === 'error'
                           ? 'text-rose-400'
                           : 'text-slate-400'
@@ -425,6 +429,8 @@ export const AuthModal: React.FC = () => {
                         ? 'Cloud Synced'
                         : syncStatusState === 'syncing' || syncStatusState === 'signing_in'
                         ? 'Synchronising...'
+                        : syncStatusState === 'migration_pending'
+                        ? 'Migration Review Required'
                         : syncStatusState === 'error'
                         ? 'Sync Issue'
                         : 'Local-only'}

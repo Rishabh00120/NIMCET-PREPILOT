@@ -22,9 +22,13 @@ import {
   User,
   Check,
   AlertCircle,
+  Laptop,
+  Monitor,
+  Send,
+  Trash2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { setupWebPushSubscription, getPreMigrationBackups } from '../services/firebase';
+import { setupWebPushSubscription, getPreMigrationBackups, getOrCreateDeviceId } from '../services/firebase';
 import { PWAInstallButton } from '../components/PWAInstallButton';
 
 export const SettingsView: React.FC = () => {
@@ -45,6 +49,14 @@ export const SettingsView: React.FC = () => {
     signOut,
     forceCloudSync,
     restorePreMigrationBackupKey,
+    syncPushSubscriptionToCloud,
+    sendLocalTestNotification,
+    registeredDevices,
+    refreshRegisteredDevices,
+    deactivateDevice,
+    serverDispatchStatus,
+    notificationDeliveryStatus,
+    cloudPushError,
   } = useApp();
 
   const [exactDateInput, setExactDateInput] = useState(userConfig.exactExamDate || '');
@@ -54,9 +66,14 @@ export const SettingsView: React.FC = () => {
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [importStatus, setImportStatus] = useState<string | null>(null);
 
-  // Web Push status state
+  // Web Push status and test states
   const [pushLoading, setPushLoading] = useState(false);
   const [pushStatusMessage, setPushStatusMessage] = useState<string | null>(null);
+  const [pushErrorDetail, setPushErrorDetail] = useState<string | null>(null);
+  const [testDeliveryLoading, setTestDeliveryLoading] = useState(false);
+  const [testDeliveryMessage, setTestDeliveryMessage] = useState<string | null>(null);
+
+  const currentDeviceId = getOrCreateDeviceId();
 
   const handleSaveGeneral = (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,20 +89,60 @@ export const SettingsView: React.FC = () => {
   const handleEnableWebPush = async () => {
     setPushLoading(true);
     setPushStatusMessage(null);
+    setPushErrorDetail(null);
+
+    // 1. Acquire browser permission and FCM registration token
     const result = await setupWebPushSubscription();
     setPushLoading(false);
 
-    if (result.token) {
-      updateUserConfig({
-        fcmToken: result.token,
-        firebaseConnected: true,
-        notificationsEnabled: true,
-      });
-      setPushStatusMessage('Web Push successfully enabled! Token registered for background reminders.');
-    } else {
+    if (!result.token) {
       setPushStatusMessage(result.error || 'Failed to initialize Web Push subscription.');
+      setPushErrorDetail(result.error || null);
+      return;
     }
-    setTimeout(() => setPushStatusMessage(null), 6000);
+
+    // Retain token in local user configuration for offline resilience & immediate retry
+    updateUserConfig({
+      fcmToken: result.token,
+      firebaseConnected: true,
+      notificationsEnabled: true,
+    });
+
+    // 2. Multi-device Firestore sync: register under users/{uid}/devices/{deviceId}
+    if (currentUser) {
+      setPushStatusMessage('Browser token acquired. Registering this device in Cloud Firestore...');
+      const cloudRes = await syncPushSubscriptionToCloud(result.token);
+      if (cloudRes.success) {
+        setPushStatusMessage(
+          'Device registration verified! Token and preferences saved in Cloud Firestore under your account.'
+        );
+      } else {
+        setPushStatusMessage('Local token saved, but Cloud Firestore registration failed.');
+        setPushErrorDetail(cloudRes.error || 'Failed to sync device to Cloud Firestore');
+      }
+    } else {
+      setPushStatusMessage(
+        'Token created locally! Sign in with your account above to synchronize this device with Cloud Push Reminders.'
+      );
+    }
+  };
+
+  const handleSendTestAlert = async () => {
+    setTestDeliveryLoading(true);
+    setTestDeliveryMessage(null);
+    const res = await sendLocalTestNotification();
+    setTestDeliveryLoading(false);
+    if (res.success) {
+      setTestDeliveryMessage('Test alert displayed successfully! Notification banner and sound verified.');
+    } else {
+      setTestDeliveryMessage(res.error || 'Failed to display test notification.');
+    }
+    setTimeout(() => setTestDeliveryMessage(null), 6000);
+  };
+
+  const handleDeactivate = async (deviceId: string) => {
+    if (!confirm('Deactivate push notifications for this device?')) return;
+    await deactivateDevice(deviceId);
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -251,6 +308,8 @@ export const SettingsView: React.FC = () => {
                   <Check className="h-4 w-4 text-emerald-500" />
                 ) : syncStatusState === 'syncing' || syncStatusState === 'signing_in' ? (
                   <RefreshCw className="h-4 w-4 text-blue-500 animate-spin" />
+                ) : syncStatusState === 'migration_pending' ? (
+                  <RefreshCw className="h-4 w-4 text-amber-500 animate-pulse" />
                 ) : syncStatusState === 'error' ? (
                   <AlertCircle className="h-4 w-4 text-rose-500" />
                 ) : (
@@ -264,6 +323,8 @@ export const SettingsView: React.FC = () => {
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
                     : syncStatusState === 'syncing' || syncStatusState === 'signing_in'
                     ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'
+                    : syncStatusState === 'migration_pending'
+                    ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
                     : syncStatusState === 'error'
                     ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
                     : 'bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-300'
@@ -526,14 +587,28 @@ export const SettingsView: React.FC = () => {
 
       {/* 5. Notification Controls & Server-Delivered Web Push */}
       <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-2xs dark:border-slate-800 dark:bg-slate-900 space-y-5">
-        <div>
-          <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-            <Bell className="h-4 w-4 text-amber-500" />
-            <span>Notification Architecture &amp; Delivery Status</span>
-          </h2>
-          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            PrepPilot maintains 5 distinct notification layers to guarantee reliable study prompts across all platforms and networks.
-          </p>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3 dark:border-slate-800">
+          <div>
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Bell className="h-4 w-4 text-amber-500" />
+              <span>Notification Architecture &amp; Delivery Status</span>
+            </h2>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              Honest status reporting across browser permissions, device tokens, Cloud Firestore multi-device records, and server scheduling.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => refreshRegisteredDevices()}
+              disabled={!currentUser}
+              className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 disabled:opacity-40 cursor-pointer"
+              title="Refresh registered device records"
+            >
+              <RefreshCw className="h-3 w-3 text-blue-500" />
+              <span>Refresh Status</span>
+            </button>
+          </div>
         </div>
 
         {/* 5-State Infrastructure Diagnostic Grid */}
@@ -562,7 +637,7 @@ export const SettingsView: React.FC = () => {
               </span>
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              Native browser prompt permission for banner &amp; sound alerts.
+              Native browser permission for banner alerts and sound cues.
             </p>
           </div>
 
@@ -586,7 +661,7 @@ export const SettingsView: React.FC = () => {
               </span>
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              Evaluates deadlines, timetable slots, and overdue tasks in-app.
+              Evaluates timetable sessions, test dates, and overdue tasks in-app.
             </p>
           </div>
 
@@ -611,65 +686,175 @@ export const SettingsView: React.FC = () => {
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
               {isFirebaseConfigured
-                ? 'Firebase environment credentials detected and verified.'
-                : 'Local-first fallback active; no third-party keys required.'}
+                ? 'Firebase credentials and Firestore connection verified.'
+                : 'Local-first fallback active; operates offline without cloud setup.'}
             </p>
           </div>
 
-          {/* State 4: Registered Device Subscription */}
+          {/* State 4: Device Push Token & Multi-Device Sync */}
           <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-950/40">
             <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
               4. Device Push Token
             </div>
             <div className="flex items-center justify-between">
               <span className="font-semibold text-slate-900 dark:text-white">
-                {userConfig.fcmToken ? 'Subscribed' : 'Not Subscribed'}
+                {userConfig.fcmToken ? (userConfig.lastSubscriptionSyncAt ? 'Cloud Synced' : 'Stored Locally') : 'Unregistered'}
               </span>
               <span
                 className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold ${
-                  userConfig.fcmToken
+                  userConfig.fcmToken && userConfig.lastSubscriptionSyncAt
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                    : userConfig.fcmToken
+                    ? 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300'
                     : 'bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-300'
                 }`}
               >
-                {userConfig.fcmToken ? 'Token Stored' : 'Unregistered'}
+                {userConfig.fcmToken && userConfig.lastSubscriptionSyncAt
+                  ? 'Multi-Device Ready'
+                  : userConfig.fcmToken
+                  ? 'Local Token'
+                  : 'Unregistered'}
               </span>
             </div>
             <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
               {userConfig.fcmToken
-                ? 'Browser registration token is synced with unified service worker.'
-                : 'Token not yet registered for background push.'}
+                ? userConfig.lastSubscriptionSyncAt
+                  ? `Registered to Cloud Firestore on ${new Date(userConfig.lastSubscriptionSyncAt).toLocaleTimeString()}`
+                  : 'Token created locally; sign in to sync with your cloud account.'
+                : 'Token not yet registered for background Web Push.'}
             </p>
           </div>
 
-          {/* State 5: Server-Side Push Delivery */}
+          {/* State 5: Honest Server-Side Push Delivery Status */}
           <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-950/40 sm:col-span-2 lg:col-span-2">
             <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-              5. Server-Side Push Delivery
+              5. Scheduled Server Delivery
             </div>
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-slate-900 dark:text-white">
-                {isFirebaseConfigured && userConfig.fcmToken
-                  ? 'Server Dispatch Active'
-                  : 'Client-Authoritative Dispatch'}
-              </span>
-              <span
-                className={`rounded-md px-2 py-0.5 text-[10px] font-mono font-bold ${
-                  isFirebaseConfigured && userConfig.fcmToken
-                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
-                    : 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300'
-                }`}
-              >
-                {isFirebaseConfigured && userConfig.fcmToken
-                  ? 'Cloud Messaging'
-                  : 'Local PWA Workers'}
-              </span>
-            </div>
-            <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-              {isFirebaseConfigured && userConfig.fcmToken
-                ? 'Backend cloud workers trigger remote push dispatches for upcoming tests & slots.'
-                : 'Service worker and tab timers trigger local scheduled notifications without server dependency.'}
-            </p>
+
+            {(() => {
+              switch (notificationDeliveryStatus) {
+                case 'not_configured':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-900 dark:text-white">Not configured</span>
+                        <span className="rounded-md bg-slate-200 px-2 py-0.5 text-[10px] font-mono font-bold text-slate-800 dark:bg-slate-800 dark:text-slate-300">
+                          Local-First Mode
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Firebase configuration is not present. Reminders trigger via in-app timers and unified Service Worker when the app is open.
+                      </p>
+                    </div>
+                  );
+
+                case 'permission_required':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-amber-600 dark:text-amber-400">Browser permission required</span>
+                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                          Permission Needed
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Click &quot;Register Web Push&quot; below to allow browser notification prompts on this device.
+                      </p>
+                    </div>
+                  );
+
+                case 'token_pending':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-blue-600 dark:text-blue-400">Token registration pending</span>
+                        <span className="rounded-md bg-blue-100 px-2 py-0.5 text-[10px] font-mono font-bold text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                          Token Pending
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Browser permission granted. Click &quot;Register Web Push&quot; to acquire this device&apos;s FCM registration token.
+                      </p>
+                    </div>
+                  );
+
+                case 'token_registered':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-indigo-600 dark:text-indigo-400">Device token registered</span>
+                        <span className="rounded-md bg-indigo-100 px-2 py-0.5 text-[10px] font-mono font-bold text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300">
+                          Local Token Ready
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Token generated on this device. {currentUser ? 'Click "Register Web Push" to sync it with your Cloud Firestore account.' : 'Sign in above to link this device to your cloud account.'}
+                      </p>
+                    </div>
+                  );
+
+                case 'delivery_error':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-rose-600 dark:text-rose-400">Delivery error</span>
+                        <span className="rounded-md bg-rose-100 px-2 py-0.5 text-[10px] font-mono font-bold text-rose-800 dark:bg-rose-950 dark:text-rose-300">
+                          Dispatch Issue
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-rose-600/90 dark:text-rose-300">
+                        Recent push dispatch failed: {serverDispatchStatus?.recentDelivery?.error || 'Target FCM token could not be reached.'}
+                      </p>
+                    </div>
+                  );
+
+                case 'delivery_test_succeeded':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">Delivery test succeeded</span>
+                        <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                          Verified Operational
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Recent delivery test confirmed for &quot;{serverDispatchStatus?.recentDelivery?.title}&quot; at {new Date(serverDispatchStatus?.recentDelivery?.timestamp || '').toLocaleTimeString()}.
+                      </p>
+                    </div>
+                  );
+
+                case 'backend_configured':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">Scheduled backend configured</span>
+                        <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                          Cloud Scheduler Active
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Verified Cloud Functions backend is deployed ({serverDispatchStatus?.scheduler || 'Asia/Kolkata'}). Last heartbeat: {serverDispatchStatus?.lastRunAt ? new Date(serverDispatchStatus.lastRunAt).toLocaleTimeString() : 'Recent'}.
+                      </p>
+                    </div>
+                  );
+
+                case 'backend_not_deployed':
+                default:
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-amber-600 dark:text-amber-400">Scheduled delivery not configured</span>
+                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                          Backend Not Deployed
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Device tokens are safely recorded in Cloud Firestore, but the scheduled Firebase Cloud Function has not been deployed yet. Reminders are served via in-app alerts and local PWA service worker.
+                      </p>
+                    </div>
+                  );
+              }
+            })()}
           </div>
         </div>
 
@@ -680,32 +865,157 @@ export const SettingsView: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Server className="h-4 w-4 text-blue-600 dark:text-blue-400" />
                 <span className="text-xs font-bold text-slate-900 dark:text-white">
-                  Register or Refresh Web Push Subscription
+                  Multi-Device Web Push Registration
                 </span>
               </div>
               <p className="mt-1 text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
-                Connects browser to the unified Workbox push handler to receive study prompts.
+                Generates a privacy-conscious device token for this {getOrCreateDeviceId().slice(0, 10)}... device and registers it under your account in Cloud Firestore.
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 onClick={handleEnableWebPush}
                 disabled={pushLoading}
-                className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50 shrink-0 shadow-2xs cursor-pointer"
+                className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50 shadow-2xs cursor-pointer"
               >
                 <Key className="h-3.5 w-3.5" />
                 <span>{pushLoading ? 'Registering...' : 'Register Web Push'}</span>
               </button>
+
+              <button
+                onClick={handleSendTestAlert}
+                disabled={testDeliveryLoading}
+                className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 disabled:opacity-50 cursor-pointer shadow-2xs"
+                title="Send an immediate test alert to verify notification sound and banner"
+              >
+                <Send className="h-3.5 w-3.5 text-amber-500" />
+                <span>{testDeliveryLoading ? 'Sending...' : 'Test Notification'}</span>
+              </button>
             </div>
           </div>
 
+          {/* Registration Status Feedback */}
           {pushStatusMessage && (
             <div className="mt-3 rounded-lg bg-white p-2.5 text-xs text-slate-800 dark:bg-slate-900 dark:text-slate-200 border border-blue-200 dark:border-blue-900 font-medium">
               {pushStatusMessage}
             </div>
           )}
+
+          {/* Registration Error Detail with Retry */}
+          {(pushErrorDetail || cloudPushError) && (
+            <div className="mt-3 rounded-lg bg-rose-50 p-2.5 text-xs text-rose-800 dark:bg-rose-950/50 dark:text-rose-300 border border-rose-200 dark:border-rose-900 flex items-start justify-between gap-2">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="h-4 w-4 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Registration Issue:</span> {pushErrorDetail || cloudPushError}
+                  <p className="mt-0.5 text-[11px] text-rose-600/90 dark:text-rose-300/80">
+                    Your local device token is retained. Check network connectivity or Firestore security rules, then retry.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => userConfig.fcmToken && syncPushSubscriptionToCloud(userConfig.fcmToken)}
+                className="rounded bg-rose-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-rose-700 shrink-0 cursor-pointer"
+              >
+                Retry Cloud Sync
+              </button>
+            </div>
+          )}
+
+          {/* Test Alert Feedback */}
+          {testDeliveryMessage && (
+            <div className="mt-3 rounded-lg bg-emerald-50 p-2.5 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-900 font-medium">
+              {testDeliveryMessage}
+            </div>
+          )}
         </div>
+
+        {/* Multi-Device Management Subpanel */}
+        {currentUser && (
+          <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-950/30">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Smartphone className="h-4 w-4 text-blue-500" />
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Registered Devices ({registeredDevices.length})
+                </span>
+              </div>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                User: <span className="font-mono">{currentUser.uid.slice(0, 8)}...</span>
+              </span>
+            </div>
+
+            {registeredDevices.length === 0 ? (
+              <p className="text-xs text-slate-500 dark:text-slate-400 italic">
+                No active devices registered yet. Click &quot;Register Web Push&quot; above to link this browser.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {registeredDevices.map((dev) => {
+                  const isCurrent = dev.deviceId === currentDeviceId;
+                  return (
+                    <div
+                      key={dev.deviceId}
+                      className={`flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg border p-3 text-xs transition-colors ${
+                        isCurrent
+                          ? 'border-blue-500/50 bg-blue-50/30 dark:border-blue-900/60 dark:bg-blue-950/20'
+                          : 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 shrink-0">
+                          {dev.deviceType === 'mobile' ? (
+                            <Smartphone className="h-4 w-4 text-blue-500" />
+                          ) : dev.deviceType === 'tablet' ? (
+                            <Smartphone className="h-4 w-4 text-purple-500" />
+                          ) : (
+                            <Laptop className="h-4 w-4 text-emerald-500" />
+                          )}
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-slate-900 dark:text-white">
+                              {dev.deviceLabel || 'Registered Browser'}
+                            </span>
+                            {isCurrent && (
+                              <span className="rounded bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300 px-1.5 py-0.2 text-[10px] font-bold">
+                                This Device
+                              </span>
+                            )}
+                            <span
+                              className={`rounded px-1.5 py-0.2 text-[10px] font-mono ${
+                                dev.active
+                                  ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                                  : 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                              }`}
+                            >
+                              {dev.active ? 'Active' : 'Deactivated'}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                            ID: {dev.deviceId} &bull; Timezone: {dev.timezone || 'Asia/Kolkata'} &bull; Last seen: {new Date(dev.lastActiveAt).toLocaleString()}
+                          </p>
+                        </div>
+                      </div>
+
+                      {dev.active && (
+                        <button
+                          onClick={() => handleDeactivate(dev.deviceId)}
+                          className="flex items-center gap-1 rounded bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 dark:bg-slate-800 dark:hover:bg-rose-950/60 dark:text-slate-300 dark:hover:text-rose-300 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer self-start sm:self-center"
+                          title="Deactivate push messages for this device"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>Deactivate</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-slate-800 text-xs">
           <div>

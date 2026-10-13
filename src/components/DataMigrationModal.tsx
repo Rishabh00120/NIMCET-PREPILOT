@@ -15,7 +15,7 @@ import { useApp } from '../context/AppContext';
 import { getDataSummary } from '../services/firebase';
 
 export const DataMigrationModal: React.FC = () => {
-  const { migrationPrompt, resolveMigration } = useApp();
+  const { migrationPrompt, resolveMigration, syncErrorMessage } = useApp();
   const [loadingStrategy, setLoadingStrategy] = useState<'merge' | 'upload_local' | 'use_cloud' | null>(null);
 
   if (!migrationPrompt || !migrationPrompt.isOpen) return null;
@@ -69,7 +69,7 @@ export const DataMigrationModal: React.FC = () => {
         </div>
 
         {/* Reassuring Backup Notice */}
-        <div className="mb-5 rounded-xl border border-slate-800 bg-slate-950/70 p-3.5 text-xs text-slate-300">
+        <div className="mb-4 rounded-xl border border-slate-800 bg-slate-950/70 p-3.5 text-xs text-slate-300">
           <div className="flex items-center gap-2 font-semibold text-white mb-1">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
             <span>Pre-Migration Safety Backup Saved</span>
@@ -79,6 +79,22 @@ export const DataMigrationModal: React.FC = () => {
             You can view or restore this backup at any time from <strong>Settings &gt; Data Management</strong>.
           </p>
         </div>
+
+        {/* Sync Error Alert if migration write failed */}
+        {syncErrorMessage && (
+          <div className="mb-4 rounded-xl border border-rose-800/80 bg-rose-950/70 p-3.5 text-xs text-rose-200 animate-fade-in">
+            <div className="flex items-center gap-2 font-semibold text-rose-300 mb-1">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>Migration Synchronization Issue</span>
+            </div>
+            <p className="text-rose-200/90 leading-relaxed font-mono text-[11px] break-all">
+              {syncErrorMessage}
+            </p>
+            <p className="mt-1.5 text-[11px] text-rose-300">
+              Your local records and backup remain completely preserved. You can safely retry below.
+            </p>
+          </div>
+        )}
 
         {/* Side-by-side data comparison */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6 text-xs">

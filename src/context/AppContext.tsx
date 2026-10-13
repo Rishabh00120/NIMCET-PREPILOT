@@ -21,6 +21,8 @@ import {
   PYQPaperRecord,
   PYQPaperAttempt,
   PYQPaperStatus,
+  DevicePushRecord,
+  NotificationDeliveryStatus,
 } from '../types';
 import { INITIAL_SYLLABUS_SUBJECTS, getAllTrackableTopics } from '../data/seedSyllabus';
 import { INITIAL_MONTHLY_GOALS } from '../data/seedRoadmap';
@@ -54,9 +56,18 @@ import {
   subscribeToRemoteUserData,
   mergeLocalAndRemoteData,
   mergeItemsById,
+  mergeSubjects,
+  mergeTopics,
   hasCustomUserData,
   savePreMigrationBackup,
   getPreMigrationBackups,
+  syncRemindersToFirestore,
+  registerDevicePushSubscription,
+  fetchRegisteredDevices,
+  deactivateDeviceSubscription,
+  fetchServerDispatchStatus,
+  getOrCreateDeviceId,
+  type ServerStatusCheckResult,
   type FullUserDataPayload,
   type SyncStatusState,
 } from '../services/firebase';
@@ -333,6 +344,15 @@ interface AppContextType {
   exportBackupJSON: () => void;
   importBackupJSON: (jsonData: string) => boolean;
   resetAllData: () => void;
+
+  syncPushSubscriptionToCloud: (tokenOverride?: string) => Promise<{ success: boolean; error?: string }>;
+  sendLocalTestNotification: () => Promise<{ success: boolean; error?: string }>;
+  registeredDevices: DevicePushRecord[];
+  refreshRegisteredDevices: () => Promise<void>;
+  deactivateDevice: (deviceId: string) => Promise<{ success: boolean; error?: string }>;
+  serverDispatchStatus: ServerStatusCheckResult | null;
+  notificationDeliveryStatus: NotificationDeliveryStatus;
+  cloudPushError: string | null;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -825,7 +845,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               isLocalEmpty: false,
               user,
             });
-            setSyncStatusState('synced');
+            setSyncStatusState('migration_pending');
             return;
           }
 
@@ -872,9 +892,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (remoteRes.exists && remoteRes.data) {
             // Merge local and cloud data safely using deterministic conflict resolution
             const merged = mergeLocalAndRemoteData(currentLocal, remoteRes.data);
-            applyRemotePayload(merged);
 
-            // Update cloud with merged state and verify result
+            // Update cloud with merged state and verify result before applying locally
             const uploadRes = await uploadFullLocalDataToRemote(user.uid, merged);
             if (!uploadRes.success) {
               setSyncStatusState('error');
@@ -882,6 +901,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               markPendingOffline(true);
               return;
             }
+            applyRemotePayload(merged);
           } else {
             // First time cloud user with no existing cloud document: upload local state to remote
             const uploadRes = await uploadFullLocalDataToRemote(user.uid, currentLocal);
@@ -928,21 +948,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (isRemoteApplyingRef.current) return;
 
         isRemoteApplyingRef.current = true;
-        // 1. Tasks
-        setTasks((prev) => mergeItemsById(prev, remoteData.tasks));
+        // 1. Tasks: preserve tombstones so remote deletions propagate locally
+        setTasks((prev) => mergeItemsById(prev, remoteData.tasks, true));
         // 2. Study Sessions
-        setStudySessions((prev) => mergeItemsById(prev, remoteData.studySessions));
+        setStudySessions((prev) => mergeItemsById(prev, remoteData.studySessions, true));
         // 3. PYQ Entries
-        setPyqEntries((prev) => mergeItemsById(prev, remoteData.pyqEntries));
+        setPyqEntries((prev) => mergeItemsById(prev, remoteData.pyqEntries, true));
         // 4. Mock Tests
-        setMockTests((prev) => mergeItemsById(prev, remoteData.mockTests));
+        setMockTests((prev) => mergeItemsById(prev, remoteData.mockTests, true));
         // 5. Error Logs
-        setErrorLogs((prev) => mergeItemsById(prev, remoteData.errorLogs));
+        setErrorLogs((prev) => mergeItemsById(prev, remoteData.errorLogs, true));
         // 6. Revision Items
-        setRevisionItems((prev) => mergeItemsById(prev, remoteData.revisionItems));
+        setRevisionItems((prev) => mergeItemsById(prev, remoteData.revisionItems, true));
         // 7. Timetable Slots
         if (remoteData.timetableSlots && remoteData.timetableSlots.length > 0) {
-          setTimetableSlots((prev) => mergeItemsById(prev, remoteData.timetableSlots));
+          setTimetableSlots((prev) => mergeItemsById(prev, remoteData.timetableSlots, true));
         }
         // 8. Monthly Goals
         if (remoteData.monthlyGoals && remoteData.monthlyGoals.length > 0) {
@@ -955,48 +975,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         // 9. PYQ Paper Records
         if (remoteData.pyqPaperRecords && Object.keys(remoteData.pyqPaperRecords).length > 0) {
-          setPyqPaperRecords((prev) => ({ ...prev, ...remoteData.pyqPaperRecords }));
-        }
-        // 10. Subjects & Topic Completion
-        if (remoteData.subjects && remoteData.subjects.length > 0) {
-          setSubjects((prev) => {
-            return prev.map((localSubj) => {
-              const remoteSubj = remoteData.subjects.find((s) => s.id === localSubj.id);
-              if (!remoteSubj) return localSubj;
-
-              return {
-                ...localSubj,
-                chapters: localSubj.chapters.map((localCh) => {
-                  const remoteCh = remoteSubj.chapters.find((c) => c.id === localCh.id);
-                  if (!remoteCh) return localCh;
-
-                  return {
-                    ...localCh,
-                    topics: localCh.topics.map((localTop) => {
-                      const remoteTop = remoteCh.topics.find((t) => t.id === localTop.id);
-                      if (!remoteTop) return localTop;
-
-                      const isCompleted = localTop.completed || remoteTop.completed;
-                      const completedAt = localTop.completedAt || remoteTop.completedAt;
-                      const questionsSolved = Math.max(localTop.questionsSolved || 0, remoteTop.questionsSolved || 0);
-                      const questionsCorrect = Math.max(localTop.questionsCorrect || 0, remoteTop.questionsCorrect || 0);
-                      const actualHours = Math.max(localTop.actualHours || 0, remoteTop.actualHours || 0);
-
-                      return {
-                        ...localTop,
-                        completed: isCompleted,
-                        completedAt,
-                        questionsSolved,
-                        questionsCorrect,
-                        actualHours,
-                        status: isCompleted ? 'completed' : localTop.status !== 'not_started' ? localTop.status : remoteTop.status,
-                      };
-                    }),
-                  };
-                }),
-              };
-            });
+          setPyqPaperRecords((prev) => {
+            const mergedPapers: Record<number, PYQPaperRecord> = { ...prev };
+            for (const [yStr, remoteRec] of Object.entries(remoteData.pyqPaperRecords)) {
+              const yr = Number(yStr);
+              const localRec = prev[yr];
+              if (!localRec) {
+                mergedPapers[yr] = remoteRec;
+              } else {
+                mergedPapers[yr] = {
+                  ...remoteRec,
+                  attempts: mergeItemsById(localRec.attempts || [], remoteRec.attempts || [], true),
+                  status: localRec.status === 'practised' || remoteRec.status === 'practised' ? 'practised' : 'in_progress',
+                };
+              }
+            }
+            return mergedPapers;
           });
+        }
+        // 10. Subjects & Topic Completion: deterministic conflict resolution (LWW)
+        if (remoteData.subjects && remoteData.subjects.length > 0) {
+          setSubjects((prev) => mergeSubjects(prev, remoteData.subjects));
         }
         // 11. User Config
         if (remoteData.userConfig && Object.keys(remoteData.userConfig).length > 0) {
@@ -1237,12 +1236,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSyncErrorMessage(null);
 
       try {
-        // Guarantee safety backup
+        // Guarantee pre-migration safety backup before any migration action
         savePreMigrationBackup(localData);
 
         if (strategy === 'merge' && remoteData) {
           const merged = mergeLocalAndRemoteData(localData, remoteData);
-          applyRemotePayload(merged);
+          // Await the actual Firestore write BEFORE applying to local state
           const res = await uploadFullLocalDataToRemote(user.uid, merged);
           if (!res.success) {
             setSyncStatusState('error');
@@ -1250,8 +1249,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             markPendingOffline(true);
             return;
           }
+          // Only update local state after Firestore write is verified
+          applyRemotePayload(merged);
         } else if (strategy === 'upload_local') {
-          applyRemotePayload(localData);
+          // Await the actual Firestore write BEFORE claiming completion
           const res = await uploadFullLocalDataToRemote(user.uid, localData);
           if (!res.success) {
             setSyncStatusState('error');
@@ -1259,7 +1260,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             markPendingOffline(true);
             return;
           }
+          applyRemotePayload(localData);
         } else if (strategy === 'use_cloud' && remoteData) {
+          // Distinct operation: Replace local records with cloud records
           applyRemotePayload(remoteData);
         }
 
@@ -1294,8 +1297,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const raw = localStorage.getItem(backupKey);
         if (!raw) return false;
         const parsed = JSON.parse(raw);
-        if (!parsed.payload) return false;
-        applyRemotePayload(parsed.payload);
+        const payloadData = parsed.payload || parsed.data;
+        if (!payloadData) return false;
+        applyRemotePayload(payloadData);
         return true;
       } catch (err) {
         console.error('Failed to restore backup key:', err);
@@ -1345,6 +1349,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return Math.round(weightedSum * 100);
   }, [subjects]);
 
+  // Active / Visible entities (filtering out durable deletion tombstones for UI views)
+  const visibleTasks = useMemo(() => tasks.filter((t) => !t.deletedAt), [tasks]);
+  const visibleTimetableSlots = useMemo(() => timetableSlots.filter((s) => !s.deletedAt), [timetableSlots]);
+  const visibleStudySessions = useMemo(() => studySessions.filter((s) => !s.deletedAt), [studySessions]);
+  const visiblePYQEntries = useMemo(() => pyqEntries.filter((e) => !e.deletedAt), [pyqEntries]);
+  const visibleMockTests = useMemo(() => mockTests.filter((m) => !m.deletedAt), [mockTests]);
+  const visibleErrorLogs = useMemo(() => errorLogs.filter((e) => !e.deletedAt), [errorLogs]);
+  const visibleRevisionItems = useMemo(() => revisionItems.filter((r) => !r.deletedAt), [revisionItems]);
+
   const subjectStats = useMemo(() => {
     const stats: Record<SubjectId, SubjectStat> = {} as Record<SubjectId, SubjectStat>;
     subjects.forEach((subj) => {
@@ -1372,7 +1385,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Weekly study hours: filtered strictly to current Monday-Sunday calendar week in Asia/Kolkata
   const studyHoursThisWeek = useMemo(() => {
-    const totalMins = studySessions
+    const totalMins = visibleStudySessions
       .filter(
         (s) =>
           (s.status === 'completed' || s.status === 'partially_completed') &&
@@ -1380,15 +1393,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
       .reduce((sum, s) => sum + (s.actualMinutes || 0), 0);
     return Math.round((totalMins / 60) * 10) / 10;
-  }, [studySessions, todayDate]);
+  }, [visibleStudySessions, todayDate]);
 
   // Lifetime total study hours logged across all historical sessions
   const totalStudyHoursLogged = useMemo(() => {
-    const totalMins = studySessions
+    const totalMins = visibleStudySessions
       .filter((s) => s.status === 'completed' || s.status === 'partially_completed')
       .reduce((sum, s) => sum + (s.actualMinutes || 0), 0);
     return Math.round((totalMins / 60) * 10) / 10;
-  }, [studySessions]);
+  }, [visibleStudySessions]);
 
   // Dynamic exam countdown
   const daysRemainingUntilExam = useMemo(() => {
@@ -1399,25 +1412,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Genuine consecutive-day study streak
   const currentStudyStreak = useMemo(() => {
-    const activeSessions = studySessions.filter(
+    const activeSessions = visibleStudySessions.filter(
       (s) => (s.status === 'completed' || s.status === 'partially_completed') && (s.actualMinutes || 0) > 0
     );
     return calculateConsecutiveStudyStreak(
       activeSessions.map((s) => s.date),
       todayDate
     );
-  }, [studySessions, todayDate]);
+  }, [visibleStudySessions, todayDate]);
 
   const nextScheduledSession = useMemo(() => {
-    return timetableSlots.find((s) => !s.isBreak) || null;
-  }, [timetableSlots]);
+    return visibleTimetableSlots.find((s) => !s.isBreak) || null;
+  }, [visibleTimetableSlots]);
 
   const nextPlannedTest = useMemo(() => {
-    const upcoming = mockTests
+    const upcoming = visibleMockTests
       .filter((t) => !t.completed && t.scheduledDate >= todayDate)
       .sort((a, b) => a.scheduledDate.localeCompare(b.scheduledDate));
     return upcoming[0] || null;
-  }, [mockTests, todayDate]);
+  }, [visibleMockTests, todayDate]);
 
   // "Almost Finished Chapters" calculation
   const almostFinishedChapters = useMemo(() => {
@@ -1447,7 +1460,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // "Today's Mission" - Top 3 pending tasks for today
   const todaysTopTasks = useMemo(() => {
-    return tasks
+    return visibleTasks
       .filter((t) => t.status === 'pending')
       .sort((a, b) => {
         const pRank: Record<string, number> = { urgent: 4, high: 3, medium: 2, low: 1 };
@@ -1456,7 +1469,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return a.deadline.localeCompare(b.deadline);
       })
       .slice(0, 3);
-  }, [tasks]);
+  }, [visibleTasks]);
 
   // Heatmap: last 7 days of consistency leading up to todayDate
   const recentWeekStudyHeatmap = useMemo(() => {
@@ -1466,7 +1479,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     for (let i = 6; i >= 0; i--) {
       const dateStr = addDaysToDateString(todayDate, -i);
       const d = parseDateAtNoon(dateStr);
-      const mins = studySessions
+      const mins = visibleStudySessions
         .filter((s) => s.date === dateStr && s.status !== 'skipped')
         .reduce((sum, s) => sum + (s.actualMinutes || 0), 0);
 
@@ -1506,14 +1519,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     xp += completedTopicsCount * 60;
 
     // Completed tasks: 50 XP
-    const completedTasksCount = tasks.filter((t) => t.status === 'completed').length;
+    const completedTasksCount = visibleTasks.filter((t) => t.status === 'completed').length;
     xp += completedTasksCount * 50;
 
     // PYQs attempted: 2 XP per question
-    const totalPYQAttempted = pyqEntries.reduce((sum, e) => sum + e.attempted, 0);
-    // Also include questions attempted from PYQ paper library
+    const totalPYQAttempted = visiblePYQEntries.reduce((sum, e) => sum + e.attempted, 0);
+    // Also include questions attempted from PYQ paper library (excluding deleted attempts)
     const paperQuestionsAttempted = Object.values(pyqPaperRecords).reduce(
-      (sum, r) => sum + r.attempts.reduce((aSum, a) => aSum + (a.attempted || 0), 0),
+      (sum, r) => sum + (r.attempts || []).filter((a) => !a.deletedAt).reduce((aSum, a) => aSum + (a.attempted || 0), 0),
       0
     );
     xp += (totalPYQAttempted + paperQuestionsAttempted) * 2;
@@ -1522,11 +1535,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     xp += pyqPapersPractisedCount * 100;
 
     // Study minutes: 1 XP per minute studied
-    const totalMinsStudied = studySessions.reduce((sum, s) => sum + (s.actualMinutes || 0), 0);
+    const totalMinsStudied = visibleStudySessions.reduce((sum, s) => sum + (s.actualMinutes || 0), 0);
     xp += totalMinsStudied;
 
     // Completed mock tests: 120 XP
-    const completedMocksCount = mockTests.filter((m) => m.completed).length;
+    const completedMocksCount = visibleMockTests.filter((m) => m.completed).length;
     xp += completedMocksCount * 120;
 
     // Check Badge unlock conditions
@@ -1549,7 +1562,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           isUnlocked = (totalPYQAttempted + paperQuestionsAttempted) >= 100;
           break;
         case 'first_mock':
-          isUnlocked = mockTests.some((m) => m.testType === 'full_mock' && m.completed);
+          isUnlocked = visibleMockTests.some((m) => m.testType === 'full_mock' && m.completed);
           break;
         case 'month_target':
           isUnlocked = monthlyGoals.some(
@@ -1746,6 +1759,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Update Topic & status recalculation
   const updateTopic = useCallback((topicId: string, updates: Partial<SyllabusTopic>) => {
+    const now = new Date().toISOString();
     setSubjects((prevSubjects) => {
       return prevSubjects.map((subject) => ({
         ...subject,
@@ -1754,12 +1768,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           topics: chapter.topics.map((topic) => {
             if (topic.id !== topicId) return topic;
 
-            const updated: SyllabusTopic = { ...topic, ...updates };
+            const updated: SyllabusTopic = { ...topic, ...updates, updatedAt: now };
 
             if (updated.completed) {
               updated.status = 'completed';
               if (!updated.completedAt) {
-                updated.completedAt = new Date().toISOString();
+                updated.completedAt = now;
               }
             } else {
               if (updated.targetCompletionDate < todayDate) {
@@ -1769,7 +1783,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               } else {
                 updated.status = 'not_started';
               }
-              updated.completedAt = undefined;
+              delete updated.completedAt;
             }
 
             return updated;
@@ -1799,6 +1813,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       actualMinutes: elapsedMinutes,
       notes: 'Completed in Distraction-Free Focus Mode.',
       loggedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
     setStudySessions((prev) => [newSession, ...prev]);
 
@@ -1842,6 +1857,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Generate spaced revision item for a studied topic
   const addRevisionScheduleForTopic = useCallback((topic: SyllabusTopic) => {
     const addDays = (dStr: string, days: number) => addDaysToDateString(dStr, days);
+    const now = new Date().toISOString();
 
     const newRevisionItem: SpacedRevisionItem = {
       id: `rev-${topic.id}-${Date.now()}`,
@@ -1858,6 +1874,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         { stage: '30 Days', targetDate: addDays(todayDate, 30), completed: false },
       ],
       notes: `Automated spaced repetition cycle for ${topic.title}`,
+      updatedAt: now,
     };
     setRevisionItems((prev) => [...prev, newRevisionItem]);
 
@@ -1874,13 +1891,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       estimatedMinutes: 30,
       actualMinutes: 0,
       notes: 'Quick spaced retrieval practice and formula recall.',
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
     setTasks((prev) => [revisionTask, ...prev]);
   }, [todayDate]);
 
   // Toggle Topic Completion
   const toggleTopicCompletion = useCallback((topicId: string) => {
+    const now = new Date().toISOString();
     setSubjects((prevSubjects) => {
       let completedTarget: SyllabusTopic | null = null;
       const nextSubjects = prevSubjects.map((subject) => ({
@@ -1894,8 +1913,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               ...topic,
               completed: willBeCompleted,
               status: willBeCompleted ? 'completed' : topic.targetCompletionDate < todayDate ? 'overdue' : 'not_started',
-              completedAt: willBeCompleted ? new Date().toISOString() : undefined,
+              updatedAt: now,
             };
+            if (willBeCompleted) {
+              updatedTopic.completedAt = now;
+            } else {
+              delete (updatedTopic as any).completedAt;
+            }
             if (willBeCompleted) {
               completedTarget = updatedTopic;
             }
@@ -1913,6 +1937,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Add custom topic
   const addTopic = useCallback((subjectId: SubjectId, chapterId: string, title: string, priority: SyllabusTopic['priority'] = 'medium') => {
+    const now = new Date().toISOString();
     const newTopic: SyllabusTopic = {
       id: `cust-topic-${Date.now()}`,
       subjectId,
@@ -1929,6 +1954,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       actualHours: 0,
       questionsSolved: 0,
       questionsCorrect: 0,
+      updatedAt: now,
     };
 
     setSubjects((prev) =>
@@ -1950,23 +1976,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Tasks actions
   const addTask = useCallback((taskData: Omit<TaskItem, 'id' | 'createdAt'>) => {
+    const now = new Date().toISOString();
     const newTask: TaskItem = {
       ...taskData,
       id: `task-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
     setTasks((prev) => [newTask, ...prev]);
   }, []);
 
   const updateTask = useCallback((taskId: string, updates: Partial<TaskItem>) => {
+    const now = new Date().toISOString();
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id !== taskId) return t;
-        const updated = { ...t, ...updates };
+        const updated = { ...t, ...updates, updatedAt: now };
         if (updated.status === 'completed' && !updated.completedAt) {
-          updated.completedAt = new Date().toISOString();
+          updated.completedAt = now;
         } else if (updated.status === 'pending') {
-          updated.completedAt = undefined;
+          delete updated.completedAt;
         }
         return updated;
       })
@@ -1974,32 +2003,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const deleteTask = useCallback((taskId: string) => {
-    setTasks((prev) => prev.filter((t) => t.id !== taskId));
+    const now = new Date().toISOString();
+    setTasks((prev) =>
+      prev.map((t) => (t.id === taskId ? { ...t, deletedAt: now, updatedAt: now } : t))
+    );
   }, []);
 
   const toggleTaskCompletion = useCallback((taskId: string) => {
+    const now = new Date().toISOString();
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id !== taskId) return t;
         const nextStatus = t.status === 'completed' ? 'pending' : 'completed';
-        return {
+        const updated: TaskItem = {
           ...t,
           status: nextStatus,
-          completedAt: nextStatus === 'completed' ? new Date().toISOString() : undefined,
+          updatedAt: now,
         };
+        if (nextStatus === 'completed') {
+          updated.completedAt = now;
+        } else {
+          delete updated.completedAt;
+        }
+        return updated;
       })
     );
   }, []);
 
   const bulkCompleteTasks = useCallback((taskIds: string[]) => {
     const setIds = new Set(taskIds);
+    const now = new Date().toISOString();
     setTasks((prev) =>
       prev.map((t) => {
         if (!setIds.has(t.id)) return t;
         return {
           ...t,
           status: 'completed',
-          completedAt: new Date().toISOString(),
+          completedAt: now,
+          updatedAt: now,
         };
       })
     );
@@ -2007,14 +2048,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Timetable & Sessions
   const updateTimetableSlot = useCallback((slotId: string, updates: Partial<TimetableSlot>) => {
-    setTimetableSlots((prev) => prev.map((s) => (s.id === slotId ? { ...s, ...updates } : s)));
+    const now = new Date().toISOString();
+    setTimetableSlots((prev) =>
+      prev.map((s) => (s.id === slotId ? { ...s, ...updates, updatedAt: now } : s))
+    );
   }, []);
 
   const logStudySession = useCallback((sessionData: Omit<LoggedStudySession, 'id' | 'loggedAt'>) => {
+    const now = new Date().toISOString();
     const newSession: LoggedStudySession = {
       ...sessionData,
       id: `session-${Date.now()}`,
-      loggedAt: new Date().toISOString(),
+      loggedAt: now,
+      updatedAt: now,
     };
     setStudySessions((prev) => [newSession, ...prev]);
 
@@ -2027,37 +2073,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [updateTopic]);
 
   const updateStudySession = useCallback((sessionId: string, updates: Partial<LoggedStudySession>) => {
-    setStudySessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, ...updates } : s)));
+    const now = new Date().toISOString();
+    setStudySessions((prev) =>
+      prev.map((s) => (s.id === sessionId ? { ...s, ...updates, updatedAt: now } : s))
+    );
   }, []);
 
   const deleteStudySession = useCallback((sessionId: string) => {
-    setStudySessions((prev) => prev.filter((s) => s.id !== sessionId));
+    const now = new Date().toISOString();
+    setStudySessions((prev) =>
+      prev.map((s) => (s.id === sessionId ? { ...s, deletedAt: now, updatedAt: now } : s))
+    );
   }, []);
 
   // PYQ Tracker (Book / topic practice)
   const addPYQEntry = useCallback((entryData: Omit<PYQEntry, 'id' | 'createdAt'>) => {
+    const now = new Date().toISOString();
     const newEntry: PYQEntry = {
       ...entryData,
       id: `pyq-${Date.now()}`,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
     setPyqEntries((prev) => [newEntry, ...prev]);
   }, []);
 
   const updatePYQEntry = useCallback((entryId: string, updates: Partial<PYQEntry>) => {
-    setPyqEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, ...updates } : e)));
+    const now = new Date().toISOString();
+    setPyqEntries((prev) =>
+      prev.map((e) => (e.id === entryId ? { ...e, ...updates, updatedAt: now } : e))
+    );
   }, []);
 
   const deletePYQEntry = useCallback((entryId: string) => {
-    setPyqEntries((prev) => prev.filter((e) => e.id !== entryId));
+    const now = new Date().toISOString();
+    setPyqEntries((prev) =>
+      prev.map((e) => (e.id === entryId ? { ...e, deletedAt: now, updatedAt: now } : e))
+    );
   }, []);
 
   // PYQ Library Paper Tracking (16 Official Papers: 2011 to 2026)
   const recordPYQPaperAttempt = useCallback(
     (year: number, attemptData: Omit<PYQPaperAttempt, 'id'>, markPractised = true) => {
+      const now = new Date().toISOString();
       const newAttempt: PYQPaperAttempt = {
         ...attemptData,
         id: `pyq-attempt-${year}-${Date.now()}`,
+        updatedAt: now,
       };
 
       setPyqPaperRecords((prev) => {
@@ -2097,7 +2159,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             estimatedMinutes: 45,
             actualMinutes: 0,
             notes: `Mistake revision from NIMCET ${year} paper. Notes: ${attemptData.notes || 'None'}`,
-            createdAt: new Date().toISOString(),
+            createdAt: now,
+            updatedAt: now,
           };
           return [newTask, ...prevTasks];
         });
@@ -2108,11 +2171,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const updatePYQPaperAttempt = useCallback(
     (year: number, attemptId: string, updates: Partial<Omit<PYQPaperAttempt, 'id'>>) => {
+      const now = new Date().toISOString();
       setPyqPaperRecords((prev) => {
         const existing = prev[year];
         if (!existing) return prev;
         const updatedAttempts = existing.attempts.map((att) =>
-          att.id === attemptId ? { ...att, ...updates } : att
+          att.id === attemptId ? { ...att, ...updates, updatedAt: now } : att
         );
         return {
           ...prev,
@@ -2146,7 +2210,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             estimatedMinutes: 45,
             actualMinutes: 0,
             notes: `Mistake revision from NIMCET ${year} paper. Notes: ${updates.notes || 'None'}`,
-            createdAt: new Date().toISOString(),
+            createdAt: now,
+            updatedAt: now,
           };
           return [newTask, ...prevTasks];
         });
@@ -2226,40 +2291,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Mock Tests
   const addMockTest = useCallback((testData: Omit<MockTest, 'id'>) => {
+    const now = new Date().toISOString();
     const newTest: MockTest = {
       ...testData,
       id: `mock-${Date.now()}`,
+      updatedAt: now,
     };
     setMockTests((prev) => [newTest, ...prev]);
   }, []);
 
   const updateMockTest = useCallback((testId: string, updates: Partial<MockTest>) => {
-    setMockTests((prev) => prev.map((t) => (t.id === testId ? { ...t, ...updates } : t)));
+    const now = new Date().toISOString();
+    setMockTests((prev) => prev.map((t) => (t.id === testId ? { ...t, ...updates, updatedAt: now } : t)));
   }, []);
 
   const deleteMockTest = useCallback((testId: string) => {
-    setMockTests((prev) => prev.filter((t) => t.id !== testId));
+    const now = new Date().toISOString();
+    setMockTests((prev) =>
+      prev.map((t) => (t.id === testId ? { ...t, deletedAt: now, updatedAt: now } : t))
+    );
   }, []);
 
   // Error Log
   const addErrorLog = useCallback((logData: Omit<ErrorLogEntry, 'id'>) => {
+    const now = new Date().toISOString();
     const newLog: ErrorLogEntry = {
       ...logData,
       id: `err-${Date.now()}`,
+      updatedAt: now,
     };
     setErrorLogs((prev) => [newLog, ...prev]);
   }, []);
 
   const updateErrorLog = useCallback((logId: string, updates: Partial<ErrorLogEntry>) => {
-    setErrorLogs((prev) => prev.map((e) => (e.id === logId ? { ...e, ...updates } : e)));
+    const now = new Date().toISOString();
+    setErrorLogs((prev) => prev.map((e) => (e.id === logId ? { ...e, ...updates, updatedAt: now } : e)));
   }, []);
 
   const deleteErrorLog = useCallback((logId: string) => {
-    setErrorLogs((prev) => prev.filter((e) => e.id !== logId));
+    const now = new Date().toISOString();
+    setErrorLogs((prev) =>
+      prev.map((e) => (e.id === logId ? { ...e, deletedAt: now, updatedAt: now } : e))
+    );
   }, []);
 
   // Revision stages
   const completeRevisionStage = useCallback((revisionId: string, stageIndex: number) => {
+    const now = new Date().toISOString();
     setRevisionItems((prev) =>
       prev.map((item) => {
         if (item.id !== revisionId) return item;
@@ -2268,10 +2346,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           newIntervals[stageIndex] = {
             ...newIntervals[stageIndex],
             completed: true,
-            completedAt: new Date().toISOString(),
+            completedAt: now,
           };
         }
-        return { ...item, intervals: newIntervals };
+        return { ...item, intervals: newIntervals, updatedAt: now };
       })
     );
   }, []);
@@ -2325,6 +2403,245 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const clearAllNotifications = useCallback(() => {
     setNotifications([]);
+  }, []);
+
+  // Multi-device push states
+  const [registeredDevices, setRegisteredDevices] = useState<DevicePushRecord[]>([]);
+  const [serverDispatchStatus, setServerDispatchStatus] = useState<ServerStatusCheckResult | null>(null);
+  const [cloudPushError, setCloudPushError] = useState<string | null>(null);
+
+  // Refresh registered devices list and server health
+  const refreshRegisteredDevices = useCallback(async () => {
+    if (!currentUser) {
+      setRegisteredDevices([]);
+      setServerDispatchStatus(null);
+      return;
+    }
+    const res = await fetchRegisteredDevices(currentUser.uid);
+    if (res.success) {
+      setRegisteredDevices(res.devices);
+    }
+    const serverStatus = await fetchServerDispatchStatus(currentUser.uid);
+    setServerDispatchStatus(serverStatus);
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (currentUser) {
+      refreshRegisteredDevices();
+    } else {
+      setRegisteredDevices([]);
+      setServerDispatchStatus(null);
+    }
+  }, [currentUser, refreshRegisteredDevices]);
+
+  // Web Push Subscription & Multi-Device Reminder Sync to Cloud Firestore
+  const syncPushSubscriptionToCloud = useCallback(
+    async (tokenOverride?: string): Promise<{ success: boolean; error?: string }> => {
+      setCloudPushError(null);
+      if (!currentUser) {
+        const err = 'Sign in to sync your device push token to your cloud account.';
+        setCloudPushError(err);
+        return { success: false, error: err };
+      }
+      const token = tokenOverride || userConfig.fcmToken;
+      if (!token) {
+        const err = 'No device push token registered on this browser.';
+        setCloudPushError(err);
+        return { success: false, error: err };
+      }
+
+      const res = await registerDevicePushSubscription(currentUser.uid, {
+        token,
+        timezone: userConfig.timezone,
+        notificationPreferences: {
+          notificationsPaused: userConfig.notificationsPaused,
+          notificationFrequency: userConfig.notificationFrequency,
+          primaryStudyWindow: userConfig.primaryStudyWindow,
+          revisionWindow: userConfig.revisionWindow,
+        },
+      });
+
+      if (res.success) {
+        setUserConfig((prev) => ({
+          ...prev,
+          lastSubscriptionSyncAt: res.syncedAt || new Date().toISOString(),
+          deviceSyncStatus: 'registered',
+          deviceSyncError: null,
+        }));
+        await refreshRegisteredDevices();
+        return { success: true };
+      } else {
+        const err = res.error || 'Failed to save device subscription in Firestore';
+        setCloudPushError(err);
+        setUserConfig((prev) => ({
+          ...prev,
+          deviceSyncStatus: 'sync_error',
+          deviceSyncError: err,
+        }));
+        return { success: false, error: err };
+      }
+    },
+    [currentUser, userConfig, refreshRegisteredDevices]
+  );
+
+  const deactivateDevice = useCallback(
+    async (deviceId: string): Promise<{ success: boolean; error?: string }> => {
+      if (!currentUser) return { success: false, error: 'Sign in to manage devices' };
+      const res = await deactivateDeviceSubscription(currentUser.uid, deviceId);
+      if (res.success) {
+        await refreshRegisteredDevices();
+      }
+      return res;
+    },
+    [currentUser, refreshRegisteredDevices]
+  );
+
+  // Honest notification delivery status calculation
+  const notificationDeliveryStatus = useMemo<NotificationDeliveryStatus>(() => {
+    if (!isFirebaseConfigured()) return 'not_configured';
+    if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') {
+      return 'permission_required';
+    }
+    if (!userConfig.fcmToken) {
+      return 'token_pending';
+    }
+    if (!currentUser || !userConfig.lastSubscriptionSyncAt) {
+      return 'token_registered';
+    }
+    if (serverDispatchStatus?.recentDelivery?.status === 'failed') {
+      return 'delivery_error';
+    }
+    if (serverDispatchStatus?.recentDelivery?.status === 'delivered') {
+      return 'delivery_test_succeeded';
+    }
+    if (serverDispatchStatus?.isBackendDeployed) {
+      return 'backend_configured';
+    }
+    return 'backend_not_deployed';
+  }, [userConfig.fcmToken, userConfig.lastSubscriptionSyncAt, currentUser, serverDispatchStatus]);
+
+  // Deep-linking from notification clicks (URL hash navigation)
+  useEffect(() => {
+    const handleUrlRoute = () => {
+      if (typeof window === 'undefined') return;
+      const hash = window.location.hash.replace(/^#\/?/, '');
+      if (!hash) return;
+
+      const [sectionPart, queryPart] = hash.split('?');
+      const validSections: NavSection[] = [
+        'dashboard',
+        'focus',
+        'syllabus',
+        'roadmap',
+        'timetable',
+        'tasks',
+        'calendar',
+        'pyq',
+        'pyq_library',
+        'mocks',
+        'revision',
+        'analytics',
+        'settings',
+      ];
+
+      if (validSections.includes(sectionPart as NavSection)) {
+        setActiveSection(sectionPart as NavSection);
+      }
+
+      if (queryPart) {
+        const params = new URLSearchParams(queryPart);
+        const topicId = params.get('topic') || params.get('topicId');
+        if (topicId) {
+          const found = allTrackableTopics.find((t) => t.id === topicId);
+          if (found) {
+            setSelectedTopicForModal(found);
+          }
+        }
+      }
+    };
+
+    handleUrlRoute();
+    window.addEventListener('hashchange', handleUrlRoute);
+    return () => window.removeEventListener('hashchange', handleUrlRoute);
+  }, [allTrackableTopics]);
+
+  // Foreground Push message event receiver
+  useEffect(() => {
+    const handlePushEvent = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail) {
+        const { title, body, targetUrl } = customEvent.detail;
+        setNotifications((prev) => [
+          {
+            id: `push-${Date.now()}`,
+            type: 'spaced_revision',
+            title: title || 'PrepPilot • Study Reminder',
+            message: body || 'You have an upcoming study session.',
+            timestamp: new Date().toISOString(),
+            read: false,
+            dismissed: false,
+            actionUrl:
+              targetUrl && targetUrl.includes('mocks')
+                ? 'mocks'
+                : targetUrl && targetUrl.includes('syllabus')
+                ? 'syllabus'
+                : 'tasks',
+          },
+          ...prev,
+        ]);
+      }
+    };
+    window.addEventListener('preppilot-push-received', handlePushEvent);
+    return () => window.removeEventListener('preppilot-push-received', handlePushEvent);
+  }, []);
+
+  const sendLocalTestNotification = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      return { success: false, error: 'Browser notifications are not supported on this platform.' };
+    }
+
+    let permission = Notification.permission;
+    if (permission === 'default') {
+      permission = await Notification.requestPermission();
+    }
+    if (permission !== 'granted') {
+      return { success: false, error: 'Browser notification permission was not granted.' };
+    }
+
+    try {
+      const nowIso = new Date().toISOString();
+      const testTitle = 'PrepPilot • Study Reminder Test';
+      const testBody = 'Notification delivery is verified and operational on this device!';
+
+      // Prefer showing via active Service Worker registration
+      if ('serviceWorker' in navigator) {
+        try {
+          const reg = await navigator.serviceWorker.ready;
+          if (reg && 'showNotification' in reg) {
+            await reg.showNotification(testTitle, {
+              body: testBody,
+              icon: '/pwa-192x192.png',
+              badge: '/pwa-192x192.png',
+              tag: 'preppilot-test-verification',
+            });
+            setUserConfig((prev) => ({ ...prev, lastLocalDeliveryVerifiedAt: nowIso }));
+            return { success: true };
+          }
+        } catch {
+          // fallback to Notification constructor
+        }
+      }
+
+      new Notification(testTitle, {
+        body: testBody,
+        icon: '/pwa-192x192.png',
+        tag: 'preppilot-test-verification',
+      });
+      setUserConfig((prev) => ({ ...prev, lastLocalDeliveryVerifiedAt: nowIso }));
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to display test notification.' };
+    }
   }, []);
 
   // Continue Studying CTA: opens next incomplete task or syllabus topic
@@ -2458,7 +2775,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     // 2. Check upcoming test in next 7 days
-    const upcomingTest = mockTests.find((t) => !t.completed && t.scheduledDate >= todayDate);
+    const upcomingTest = visibleMockTests.find((t) => !t.completed && t.scheduledDate >= todayDate);
     if (upcomingTest) {
       const testId = `notif-test-${upcomingTest.id}`;
       const existing = notifications.find((n) => n.id === testId);
@@ -2485,7 +2802,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return [...newOnes, ...prev];
       });
     }
-  }, [allTrackableTopics, mockTests, todayDate, userConfig.notificationsPaused, userConfig.inAppRemindersEnabled]);
+  }, [allTrackableTopics, visibleMockTests, todayDate, userConfig.notificationsPaused, userConfig.inAppRemindersEnabled]);
 
   const value: AppContextType = {
     activeSection,
@@ -2494,13 +2811,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSelectedTopicForModal,
     todayDate,
     subjects,
-    tasks,
-    timetableSlots,
-    studySessions,
-    pyqEntries,
-    mockTests,
-    errorLogs,
-    revisionItems,
+    tasks: visibleTasks,
+    timetableSlots: visibleTimetableSlots,
+    studySessions: visibleStudySessions,
+    pyqEntries: visiblePYQEntries,
+    mockTests: visibleMockTests,
+    errorLogs: visibleErrorLogs,
+    revisionItems: visibleRevisionItems,
     monthlyGoals,
     userConfig,
     notifications,
@@ -2602,6 +2919,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     exportBackupJSON,
     importBackupJSON,
     resetAllData,
+    syncPushSubscriptionToCloud,
+    sendLocalTestNotification,
+    registeredDevices,
+    refreshRegisteredDevices,
+    deactivateDevice,
+    serverDispatchStatus,
+    notificationDeliveryStatus,
+    cloudPushError,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

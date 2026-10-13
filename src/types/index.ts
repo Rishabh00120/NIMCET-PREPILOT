@@ -22,6 +22,7 @@ export interface SyllabusTopic {
   lastRevisionDate?: string;
   nextRevisionDate?: string;
   completedAt?: string;
+  updatedAt?: string;
 }
 
 export interface SyllabusChapter {
@@ -270,6 +271,60 @@ export interface UserConfig {
   firstRunCompleted: boolean;
   fcmToken?: string | null;
   firebaseConnected?: boolean;
+  lastSubscriptionSyncAt?: string | null;
+  lastLocalDeliveryVerifiedAt?: string | null;
+  deviceId?: string | null;
+  deviceSyncStatus?: 'idle' | 'registered' | 'sync_error' | 'pending';
+  deviceSyncError?: string | null;
+}
+
+export type NotificationDeliveryStatus =
+  | 'not_configured'
+  | 'permission_required'
+  | 'token_pending'
+  | 'token_registered'
+  | 'backend_not_deployed'
+  | 'backend_configured'
+  | 'delivery_test_succeeded'
+  | 'delivery_error';
+
+export interface DevicePushRecord {
+  deviceId: string;
+  token: string;
+  timezone: string;
+  deviceType: 'mobile' | 'tablet' | 'desktop';
+  deviceLabel: string;
+  active: boolean;
+  registeredAt: string;
+  lastActiveAt: string;
+  notificationPreferences: {
+    notificationsPaused: boolean;
+    notificationFrequency: 'all' | 'daily_summary' | 'urgent_only';
+    primaryStudyWindow: string;
+    revisionWindow: string;
+  };
+}
+
+export interface UserPushSubscriptionRecord {
+  userId: string;
+  fcmToken?: string;
+  updatedAt: string;
+  lastClientSyncAt?: string;
+  lastRegisteredDeviceId?: string;
+  activeDeviceCount?: number;
+  serverDispatchStatus?: 'not_configured' | 'pending_deployment' | 'active';
+}
+
+export interface PushDeliveryRecord {
+  id: string;
+  sentAt: string;
+  tag: string;
+  title: string;
+  body: string;
+  status: 'delivered' | 'failed' | 'skipped_duplicate';
+  messageId?: string;
+  userLocalTime?: string;
+  error?: string;
 }
 
 export type NavSection = 
@@ -304,6 +359,8 @@ export interface PYQPaperAttempt {
   subjectId?: SubjectId;
   topicId?: string;
   scheduledRetestDate?: string;
+  updatedAt?: string;
+  deletedAt?: string;
 }
 
 export interface PYQPaperRecord {

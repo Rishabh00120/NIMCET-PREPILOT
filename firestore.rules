@@ -65,6 +65,23 @@ service cloud.firestore {
     // Push subscription metadata for server dispatch
     match /user_push_subscriptions/{userId} {
       allow read, write: if isOwner(userId);
+
+      // Multi-device registration: each user manages their own device tokens
+      match /devices/{deviceId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Server delivery audit history: user can read their logs, only backend Admin SDK can write
+      match /delivery_history/{deliveryId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+
+    // System-wide status for verified backend deployment health (Server Admin SDK writes only)
+    match /system_status/{statusId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
     }
 
     // Deny all other unspecified paths by default
