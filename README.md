@@ -51,7 +51,7 @@ The notification preferences view separates and transparently reports:
 ## Build, Test & Run Instructions
 
 ### Prerequisites
-- Node.js 20+
+- Node.js 22+
 - npm or bun
 
 ### Commands
@@ -91,6 +91,12 @@ The suite verifies:
 - Unweighted and NIMCET 120-question weighted completion percentages.
 - Overdue topic detection against dynamic current dates.
 - Persistence recovery and safe offline queue acknowledgment.
+- Parameterized HTTPS application URL validation, origin preservation, and hash routing.
+- Multi-device partial failures, accurate FCM acceptance versus client display, and invalid token eviction.
+- Primary study window, 23:00–00:00 revision window, quiet hours (01:00–07:00), and urgent bypass policy.
+- Account-level timezone evaluation locked to user study timezone.
+
+See [`functions/README.md`](./functions/README.md) for Cloud Functions v2 deployment and administrative testing instructions.
 
 ---
 

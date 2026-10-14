@@ -51,6 +51,7 @@ export const SettingsView: React.FC = () => {
     restorePreMigrationBackupKey,
     syncPushSubscriptionToCloud,
     sendLocalTestNotification,
+    sendServerTestNotification,
     registeredDevices,
     refreshRegisteredDevices,
     deactivateDevice,
@@ -62,6 +63,7 @@ export const SettingsView: React.FC = () => {
   const [exactDateInput, setExactDateInput] = useState(userConfig.exactExamDate || '');
   const [primaryWindow, setPrimaryWindow] = useState(userConfig.primaryStudyWindow);
   const [revisionWindow, setRevisionWindow] = useState(userConfig.revisionWindow);
+  const [urgentBypassInput, setUrgentBypassInput] = useState(userConfig.urgentBypassStudyWindow || false);
   const [saveToast, setSaveToast] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [importStatus, setImportStatus] = useState<string | null>(null);
@@ -72,6 +74,13 @@ export const SettingsView: React.FC = () => {
   const [pushErrorDetail, setPushErrorDetail] = useState<string | null>(null);
   const [testDeliveryLoading, setTestDeliveryLoading] = useState(false);
   const [testDeliveryMessage, setTestDeliveryMessage] = useState<string | null>(null);
+  const [serverTestLoading, setServerTestLoading] = useState(false);
+  const [serverTestMessage, setServerTestMessage] = useState<{
+    type: 'success' | 'partial' | 'error' | 'info';
+    text: string;
+    deliveredCount?: number;
+    failedCount?: number;
+  } | null>(null);
 
   const currentDeviceId = getOrCreateDeviceId();
 
@@ -81,6 +90,7 @@ export const SettingsView: React.FC = () => {
       exactExamDate: exactDateInput ? exactDateInput : null,
       primaryStudyWindow: primaryWindow,
       revisionWindow: revisionWindow,
+      urgentBypassStudyWindow: urgentBypassInput,
     });
     setSaveToast(true);
     setTimeout(() => setSaveToast(false), 3000);
@@ -138,6 +148,50 @@ export const SettingsView: React.FC = () => {
       setTestDeliveryMessage(res.error || 'Failed to display test notification.');
     }
     setTimeout(() => setTestDeliveryMessage(null), 6000);
+  };
+
+  const handleSendServerTestAlert = async () => {
+    if (!currentUser) {
+      setServerTestMessage({
+        type: 'error',
+        text: 'Please sign in above to dispatch a Cloud Push test to your registered devices.',
+      });
+      setTimeout(() => setServerTestMessage(null), 8000);
+      return;
+    }
+    setServerTestLoading(true);
+    setServerTestMessage(null);
+    const res = await sendServerTestNotification();
+    setServerTestLoading(false);
+
+    if (res.status === 'accepted_by_fcm' || (res.success && (!res.failedDevices || res.failedDevices === 0))) {
+      setServerTestMessage({
+        type: 'success',
+        text: res.message || 'Firebase Cloud Messaging accepted the dispatch for all registered devices! Note: FCM acceptance verifies server transmission; actual visible display on device requires browser background wake and system notification permissions.',
+        deliveredCount: res.acceptedDevices ?? res.deliveredDevices,
+        failedCount: res.failedDevices ?? 0,
+      });
+      setTimeout(() => {
+        refreshRegisteredDevices();
+      }, 1500);
+    } else if (res.status === 'partial_failure' || (res.acceptedDevices && res.acceptedDevices > 0 && res.failedDevices && res.failedDevices > 0)) {
+      setServerTestMessage({
+        type: 'partial',
+        text: res.message || `Partial Dispatch Warning: FCM accepted ${res.acceptedDevices} device(s), but failed for ${res.failedDevices} device(s). A partially successful dispatch is not counted as full success.`,
+        deliveredCount: res.acceptedDevices,
+        failedCount: res.failedDevices,
+      });
+      setTimeout(() => {
+        refreshRegisteredDevices();
+      }, 1500);
+    } else {
+      setServerTestMessage({
+        type: 'error',
+        text: res.error || res.message || 'FCM dispatch failed for all registered devices.',
+        failedCount: res.failedDevices,
+      });
+    }
+    setTimeout(() => setServerTestMessage(null), 12000);
   };
 
   const handleDeactivate = async (deviceId: string) => {
@@ -506,6 +560,29 @@ export const SettingsView: React.FC = () => {
               Default: 23:00–00:00 (1 hour for spaced recall)
             </p>
           </div>
+
+          {/* Urgent Reminders Window Policy */}
+          <div className="sm:col-span-2 pt-3 border-t border-slate-100 dark:border-slate-800">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <label className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  Allow Urgent Alerts Outside Primary Study Window
+                </label>
+                <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                  When enabled, overdue tasks, today&apos;s deadlines, and same-day mock tests can alert you outside the {primaryWindow || '14:00–21:00'} study window. When disabled, ALL reminders strictly obey the primary study window. Quiet hours (01:00–07:00) are always enforced.
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer shrink-0 mt-0.5">
+                <input
+                  type="checkbox"
+                  checked={urgentBypassInput}
+                  onChange={(e) => setUrgentBypassInput(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-200 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:bg-slate-700 peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+          </div>
         </div>
 
         <div className="pt-2 flex justify-end">
@@ -808,17 +885,47 @@ export const SettingsView: React.FC = () => {
                     </div>
                   );
 
+                case 'accepted_by_fcm':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-sky-600 dark:text-sky-400">Accepted by FCM</span>
+                        <span className="rounded-md bg-sky-100 px-2 py-0.5 text-[10px] font-mono font-bold text-sky-800 dark:bg-sky-950 dark:text-sky-300">
+                          FCM Accepted
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        Firebase Cloud Messaging accepted the dispatch. (Note: Verifies server receipt and transmission; device display depends on OS notification permissions and wake).
+                      </p>
+                    </div>
+                  );
+
+                case 'partial_failure':
+                  return (
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-amber-600 dark:text-amber-400">Partial dispatch</span>
+                        <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                          Partial Failure
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-amber-700/90 dark:text-amber-300">
+                        FCM accepted dispatches for some registered devices, but failed for others. Retries target only pending failed devices.
+                      </p>
+                    </div>
+                  );
+
                 case 'delivery_test_succeeded':
                   return (
                     <div>
                       <div className="flex items-center justify-between">
-                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">Delivery test succeeded</span>
+                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">Device display confirmed</span>
                         <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-[10px] font-mono font-bold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
                           Verified Operational
                         </span>
                       </div>
                       <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                        Recent delivery test confirmed for &quot;{serverDispatchStatus?.recentDelivery?.title}&quot; at {new Date(serverDispatchStatus?.recentDelivery?.timestamp || '').toLocaleTimeString()}.
+                        Confirmed delivery display for &quot;{serverDispatchStatus?.recentDelivery?.title}&quot; at {new Date(serverDispatchStatus?.recentDelivery?.timestamp || '').toLocaleTimeString()}.
                       </p>
                     </div>
                   );
@@ -887,10 +994,24 @@ export const SettingsView: React.FC = () => {
                 onClick={handleSendTestAlert}
                 disabled={testDeliveryLoading}
                 className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 disabled:opacity-50 cursor-pointer shadow-2xs"
-                title="Send an immediate test alert to verify notification sound and banner"
+                title="Send an immediate local test alert to verify browser notification permissions, sound, and banner"
               >
                 <Send className="h-3.5 w-3.5 text-amber-500" />
-                <span>{testDeliveryLoading ? 'Sending...' : 'Test Notification'}</span>
+                <span>{testDeliveryLoading ? 'Sending...' : 'Test Local Notification'}</span>
+              </button>
+
+              <button
+                onClick={handleSendServerTestAlert}
+                disabled={serverTestLoading || !currentUser}
+                className="flex items-center gap-1.5 rounded-lg border border-blue-300 bg-blue-50/70 hover:bg-blue-100/80 px-3 py-2 text-xs font-semibold text-blue-700 dark:border-blue-700 dark:bg-blue-950/60 dark:text-blue-300 disabled:opacity-50 cursor-pointer shadow-2xs"
+                title={
+                  currentUser
+                    ? 'Dispatch real remote push notification via Cloud Functions to test server-to-device delivery'
+                    : 'Sign in to send remote Cloud Push test'
+                }
+              >
+                <Cloud className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+                <span>{serverTestLoading ? 'Dispatching...' : 'Send Cloud Push Test'}</span>
               </button>
             </div>
           </div>
@@ -923,10 +1044,75 @@ export const SettingsView: React.FC = () => {
             </div>
           )}
 
-          {/* Test Alert Feedback */}
+          {/* Test Local Alert Feedback */}
           {testDeliveryMessage && (
             <div className="mt-3 rounded-lg bg-emerald-50 p-2.5 text-xs text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-900 font-medium">
               {testDeliveryMessage}
+            </div>
+          )}
+
+          {/* Server Cloud Push Test Feedback */}
+          {serverTestMessage && (
+            <div
+              className={`mt-3 rounded-lg p-3 text-xs border font-medium ${
+                serverTestMessage.type === 'success'
+                  ? 'bg-emerald-50 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200 border-emerald-300 dark:border-emerald-800'
+                  : serverTestMessage.type === 'partial'
+                  ? 'bg-amber-50 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200 border-amber-300 dark:border-amber-800'
+                  : 'bg-rose-50 text-rose-900 dark:bg-rose-950/60 dark:text-rose-200 border-rose-300 dark:border-rose-800'
+              }`}
+            >
+              <div className="flex items-start gap-2">
+                {serverTestMessage.type === 'success' ? (
+                  <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                ) : serverTestMessage.type === 'partial' ? (
+                  <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="h-4 w-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                )}
+                <div className="space-y-1">
+                  <div className="font-semibold">
+                    {serverTestMessage.type === 'success'
+                      ? 'FCM Accepted (Cloud Push Dispatched)'
+                      : serverTestMessage.type === 'partial'
+                      ? 'Partial FCM Dispatch (Warning)'
+                      : 'Cloud Push Test Failed'}
+                  </div>
+                  <p className="text-[11px] leading-relaxed opacity-90">
+                    {serverTestMessage.text}
+                  </p>
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] font-mono">
+                    {serverTestMessage.type === 'success' && (
+                      <>
+                        <span className="rounded bg-emerald-200/70 px-1.5 py-0.5 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-300">
+                          FCM Accepted: Yes
+                        </span>
+                        {typeof serverTestMessage.deliveredCount === 'number' && (
+                          <span className="rounded bg-emerald-200/70 px-1.5 py-0.5 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-300">
+                            Accepted Devices: {serverTestMessage.deliveredCount}
+                          </span>
+                        )}
+                        <span className="rounded bg-emerald-100 px-1.5 py-0.5 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300">
+                          Display: Requires Client Wake &amp; Permission
+                        </span>
+                      </>
+                    )}
+                    {serverTestMessage.type === 'partial' && (
+                      <>
+                        <span className="rounded bg-amber-200/70 px-1.5 py-0.5 dark:bg-amber-900 text-amber-800 dark:text-amber-300">
+                          Accepted: {serverTestMessage.deliveredCount ?? 0}
+                        </span>
+                        <span className="rounded bg-rose-200/70 px-1.5 py-0.5 dark:bg-rose-900 text-rose-800 dark:text-rose-300">
+                          Failed: {serverTestMessage.failedCount ?? 0}
+                        </span>
+                        <span className="rounded bg-amber-100 px-1.5 py-0.5 dark:bg-amber-950 text-amber-800 dark:text-amber-300">
+                          Status: Incomplete Dispatch
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>

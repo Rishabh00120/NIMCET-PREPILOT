@@ -37,6 +37,14 @@ import {
   getPreMigrationBackups,
   type FullUserDataPayload,
 } from '../src/services/firebase';
+import {
+  validateAppOrigin,
+  getAbsoluteNotificationUrl,
+  isHourInWindow,
+  isReminderWindowEligible,
+  calculateMulticastOutcomes,
+  getTimeInfo,
+} from '../functions/src/notificationUtils';
 
 let totalTests = 0;
 let passedTests = 0;
@@ -1305,6 +1313,252 @@ runTest('Partial migration failures prevent Synced status and allow clean retry'
   assert.strictEqual(syncStatus, 'synced');
   assert.strictEqual(isMigratedFlag, true);
   assert.strictEqual(syncErrorMessage, null);
+});
+
+// 10. Notification URL, Delivery Status, Window & Retry Verification
+console.log('\nGroup 10: Notification URL, Delivery Status, Window & Retry Verification');
+
+runTest('Missing PREPPILOT_APP_URL throws explicit, descriptive error', () => {
+  assert.throws(() => validateAppOrigin(''), /Missing required PREPPILOT_APP_URL/);
+  assert.throws(() => validateAppOrigin('   '), /Missing required PREPPILOT_APP_URL/);
+  assert.throws(() => validateAppOrigin(null), /Missing required PREPPILOT_APP_URL/);
+});
+
+runTest('Invalid URL formats, protocols, credentials, and non-root subpaths are rejected', () => {
+  // Malformed URL
+  assert.throws(() => validateAppOrigin('not-a-valid-url'), /Invalid PREPPILOT_APP_URL/);
+  // Non-HTTPS in production
+  assert.throws(() => validateAppOrigin('http://preppilot.com'), /Protocol must be HTTPS/);
+  assert.throws(() => validateAppOrigin('ftp://preppilot.com'), /Unsupported protocol/);
+  // Embedded credentials
+  assert.throws(() => validateAppOrigin('https://user:pass@preppilot.com'), /URLs with embedded credentials are prohibited/);
+  // Subpaths in base origin
+  assert.throws(() => validateAppOrigin('https://preppilot.com/subpath/to/app'), /Base URL must be the root origin without subpaths/);
+  // Invalid hostname
+  assert.throws(() => validateAppOrigin('https://localhost-fake'), /is not a valid production host/);
+
+  // Valid HTTPS production URL accepted
+  const validProd = validateAppOrigin('https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app');
+  assert.strictEqual(validProd, 'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app');
+
+  // Localhost allowed for development/testing
+  const validDev = validateAppOrigin('http://localhost:3000');
+  assert.strictEqual(validDev, 'http://localhost:3000');
+});
+
+runTest('Correct absolute HTTPS notification links are constructed with hash routes preserved', () => {
+  const origin = 'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app';
+
+  assert.strictEqual(
+    getAbsoluteNotificationUrl('/#/tasks?id=task_123', origin),
+    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/#/tasks?id=task_123'
+  );
+
+  assert.strictEqual(
+    getAbsoluteNotificationUrl('/#/settings', origin),
+    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/#/settings'
+  );
+
+  assert.strictEqual(
+    getAbsoluteNotificationUrl('/pwa-192x192.png', origin),
+    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/pwa-192x192.png'
+  );
+
+  // Mismatched external URLs are rejected
+  assert.throws(
+    () => getAbsoluteNotificationUrl('https://malicious-site.com/phish', origin),
+    /does not match configured app origin/
+  );
+});
+
+runTest('Multi-device partial failures: records per-device status and returns accurate counts', () => {
+  const devices = [
+    { deviceId: 'device-laptop-1', token: 'fcm-token-valid-1' },
+    { deviceId: 'device-phone-2', token: 'fcm-token-invalid-2' },
+  ];
+
+  const fcmResponses = [
+    { success: true, messageId: 'msg-success-123' },
+    { success: false, error: { code: 'messaging/internal-error', message: 'Backend transient error' } },
+  ];
+
+  const outcomes = calculateMulticastOutcomes({
+    devices,
+    fcmResponses,
+  });
+
+  // Partial failure check
+  assert.strictEqual(outcomes.overallStatus, 'partial_failure');
+  assert.strictEqual(outcomes.acceptedDevicesCount, 1);
+  assert.strictEqual(outcomes.failedDevicesCount, 1);
+
+  // Device 1
+  assert.strictEqual(outcomes.deviceOutcomes['device-laptop-1'].status, 'accepted_by_fcm');
+  assert.strictEqual(outcomes.deviceOutcomes['device-laptop-1'].fcmAccepted, true);
+  assert.strictEqual(outcomes.deviceOutcomes['device-laptop-1'].confirmedDisplayed, false);
+  assert.strictEqual(outcomes.deviceOutcomes['device-laptop-1'].messageId, 'msg-success-123');
+
+  // Device 2
+  assert.strictEqual(outcomes.deviceOutcomes['device-phone-2'].status, 'failed');
+  assert.strictEqual(outcomes.deviceOutcomes['device-phone-2'].fcmAccepted, false);
+  assert.strictEqual(outcomes.deviceOutcomes['device-phone-2'].errorCode, 'messaging/internal-error');
+});
+
+runTest('Accurate FCM acceptance versus delivery statuses and permanent invalid token eviction', () => {
+  const devices = [
+    { deviceId: 'device-1', token: 'token-active' },
+    { deviceId: 'device-2', token: 'token-expired' },
+  ];
+
+  const fcmResponses = [
+    { success: true, messageId: 'msg-456' },
+    { success: false, error: { code: 'messaging/registration-token-not-registered', message: 'Token expired' } },
+  ];
+
+  const result = calculateMulticastOutcomes({ devices, fcmResponses });
+
+  assert.strictEqual(result.invalidTokensToEvict.length, 1);
+  assert.strictEqual(result.invalidTokensToEvict[0], 'device-2');
+  assert.strictEqual(result.deviceOutcomes['device-2'].status, 'evicted');
+
+  // Full success check (all devices succeed)
+  const fullSuccessResult = calculateMulticastOutcomes({
+    devices: [{ deviceId: 'device-1', token: 'token-active' }],
+    fcmResponses: [{ success: true, messageId: 'msg-789' }],
+  });
+  assert.strictEqual(fullSuccessResult.overallStatus, 'accepted_by_fcm');
+  assert.strictEqual(fullSuccessResult.deviceOutcomes['device-1'].confirmedDisplayed, false);
+});
+
+runTest('Study and revision window enforcement with quiet hours and explicit urgent bypass', () => {
+  const primaryStudyWindow = '14:00–21:00';
+  const revisionWindow = '23:00–00:00';
+
+  // 1. Normal study reminder inside study window (15:00) -> ELIGIBLE
+  const normalInWindow = isReminderWindowEligible({
+    category: 'advance_1d',
+    priority: 'normal',
+    userHour: 15,
+    primaryStudyWindow,
+    revisionWindow,
+  });
+  assert.strictEqual(normalInWindow.eligible, true);
+
+  // 2. Normal study reminder outside study window (10:00) -> BLOCKED
+  const normalOutsideWindow = isReminderWindowEligible({
+    category: 'advance_1d',
+    priority: 'normal',
+    userHour: 10,
+    primaryStudyWindow,
+    revisionWindow,
+  });
+  assert.strictEqual(normalOutsideWindow.eligible, false);
+  assert.strictEqual(normalOutsideWindow.reason, 'outside_study_window');
+
+  // 3. Spaced revision reminder at 23:00 (inside 23:00–00:00 revision window) -> ELIGIBLE
+  const revInWindow = isReminderWindowEligible({
+    category: 'revision',
+    priority: 'normal',
+    userHour: 23,
+    primaryStudyWindow,
+    revisionWindow,
+  });
+  assert.strictEqual(revInWindow.eligible, true);
+
+  // 4. Spaced revision reminder at 14:00 (outside revision window) -> BLOCKED
+  const revOutsideWindow = isReminderWindowEligible({
+    category: 'revision',
+    priority: 'normal',
+    userHour: 14,
+    primaryStudyWindow,
+    revisionWindow,
+  });
+  assert.strictEqual(revOutsideWindow.eligible, false);
+  assert.strictEqual(revOutsideWindow.reason, 'outside_revision_window');
+
+  // 5. Urgent reminder outside study window WITHOUT explicit bypass (10:00) -> BLOCKED
+  const urgentNoBypass = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 10,
+    primaryStudyWindow,
+    revisionWindow,
+    urgentBypassStudyWindow: false,
+  });
+  assert.strictEqual(urgentNoBypass.eligible, false);
+  assert.strictEqual(urgentNoBypass.reason, 'outside_study_window_urgent_bypass_disabled');
+
+  // 6. Urgent reminder outside study window WITH explicit bypass (10:00) -> ELIGIBLE
+  const urgentWithBypass = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 10,
+    primaryStudyWindow,
+    revisionWindow,
+    urgentBypassStudyWindow: true,
+  });
+  assert.strictEqual(urgentWithBypass.eligible, true);
+
+  // 7. Quiet hours (03:00) ALWAYS blocks reminders even with urgent bypass enabled -> BLOCKED
+  const quietHoursCheck = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 3,
+    primaryStudyWindow,
+    revisionWindow,
+    urgentBypassStudyWindow: true,
+  });
+  assert.strictEqual(quietHoursCheck.eligible, false);
+  assert.strictEqual(quietHoursCheck.reason, 'quiet_hours_enforced');
+
+  // 8. Paused reminders block everything
+  const pausedCheck = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 15,
+    primaryStudyWindow,
+    revisionWindow,
+    notificationsPaused: true,
+  });
+  assert.strictEqual(pausedCheck.eligible, false);
+  assert.strictEqual(pausedCheck.reason, 'notifications_paused');
+});
+
+runTest('Account-level timezone evaluation locked to user study timezone', () => {
+  // Test timezone conversion for Asia/Kolkata
+  const fixedUtcDate = new Date('2026-10-14T18:30:00Z'); // 18:30 UTC = 00:00 IST on 2026-10-15
+  const kolkataTime = getTimeInfo('Asia/Kolkata', fixedUtcDate);
+  assert.strictEqual(kolkataTime.dateStr, '2026-10-15');
+  assert.strictEqual(kolkataTime.hour, 0);
+
+  // Window test for midnight wrap (23:00–00:00)
+  assert.strictEqual(isHourInWindow(23, '23:00–00:00'), true);
+  assert.strictEqual(isHourInWindow(0, '23:00–00:00'), false);
+  assert.strictEqual(isHourInWindow(22, '23:00–00:00'), false);
+});
+
+runTest('Retry eligibility and deduplication logic', () => {
+  // When quiet hours are active, retry is deferred
+  const retryInQuiet = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 4,
+    primaryStudyWindow: '14:00–21:00',
+    urgentBypassStudyWindow: true,
+  });
+  assert.strictEqual(retryInQuiet.eligible, false);
+  assert.strictEqual(retryInQuiet.reason, 'quiet_hours_enforced');
+
+  // When study window is closed and bypass is disabled, retry is deferred
+  const retryOutsideWindow = isReminderWindowEligible({
+    category: 'overdue',
+    priority: 'high',
+    userHour: 10,
+    primaryStudyWindow: '14:00–21:00',
+    urgentBypassStudyWindow: false,
+  });
+  assert.strictEqual(retryOutsideWindow.eligible, false);
+  assert.strictEqual(retryOutsideWindow.reason, 'outside_study_window_urgent_bypass_disabled');
 });
 
 console.log(`\n====================================================`);

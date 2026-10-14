@@ -267,6 +267,7 @@ export interface UserConfig {
   browserPermissionRequested: boolean;
   notificationFrequency: 'all' | 'daily_summary' | 'urgent_only';
   notificationsPaused: boolean;
+  urgentBypassStudyWindow?: boolean;
   weightingMethod: 'unweighted_topics' | 'nimcet_exam_weight';
   firstRunCompleted: boolean;
   fcmToken?: string | null;
@@ -285,6 +286,8 @@ export type NotificationDeliveryStatus =
   | 'token_registered'
   | 'backend_not_deployed'
   | 'backend_configured'
+  | 'accepted_by_fcm'
+  | 'partial_failure'
   | 'delivery_test_succeeded'
   | 'delivery_error';
 
@@ -321,10 +324,22 @@ export interface PushDeliveryRecord {
   tag: string;
   title: string;
   body: string;
-  status: 'delivered' | 'failed' | 'skipped_duplicate';
+  status:
+    | 'accepted_by_fcm'
+    | 'delivered'
+    | 'partial_failure'
+    | 'failed'
+    | 'skipped_duplicate'
+    | 'in_progress'
+    | 'skipped';
   messageId?: string;
   userLocalTime?: string;
   error?: string;
+  fcmAccepted?: boolean;
+  confirmedDisplayed?: boolean;
+  acceptedDevices?: number;
+  failedDevices?: number;
+  devicesTargeted?: number;
 }
 
 export type NavSection = 

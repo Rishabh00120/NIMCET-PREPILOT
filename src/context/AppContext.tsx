@@ -66,6 +66,7 @@ import {
   fetchRegisteredDevices,
   deactivateDeviceSubscription,
   fetchServerDispatchStatus,
+  triggerServerDeliveryTest,
   getOrCreateDeviceId,
   type ServerStatusCheckResult,
   type FullUserDataPayload,
@@ -347,6 +348,16 @@ interface AppContextType {
 
   syncPushSubscriptionToCloud: (tokenOverride?: string) => Promise<{ success: boolean; error?: string }>;
   sendLocalTestNotification: () => Promise<{ success: boolean; error?: string }>;
+  sendServerTestNotification: () => Promise<{
+    success: boolean;
+    status?: 'accepted_by_fcm' | 'partial_failure' | 'failed';
+    error?: string;
+    message?: string;
+    acceptedDevices?: number;
+    failedDevices?: number;
+    deliveredDevices?: number;
+    deviceOutcomes?: Record<string, any>;
+  }>;
   registeredDevices: DevicePushRecord[];
   refreshRegisteredDevices: () => Promise<void>;
   deactivateDevice: (deviceId: string) => Promise<{ success: boolean; error?: string }>;
@@ -370,6 +381,7 @@ export const INITIAL_USER_CONFIG: UserConfig = {
   browserPermissionRequested: false,
   notificationFrequency: 'all',
   notificationsPaused: false,
+  urgentBypassStudyWindow: false,
   weightingMethod: 'unweighted_topics',
   firstRunCompleted: false,
 };
@@ -2496,7 +2508,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [currentUser, refreshRegisteredDevices]
   );
 
-  // Honest notification delivery status calculation
+  const sendServerTestNotification = useCallback(async (): Promise<{
+    success: boolean;
+    status?: 'accepted_by_fcm' | 'partial_failure' | 'failed';
+    error?: string;
+    message?: string;
+    acceptedDevices?: number;
+    failedDevices?: number;
+    deliveredDevices?: number;
+    deviceOutcomes?: Record<string, any>;
+  }> => {
+    if (!currentUser) return { success: false, error: 'Sign in to trigger server delivery test' };
+    const res = await triggerServerDeliveryTest();
+    await refreshRegisteredDevices();
+    return res;
+  }, [currentUser, refreshRegisteredDevices]);
+
+  // Honest notification delivery status calculation:
+  // - Separates browser permission, FCM token registration, Firestore syncing, and server dispatch
+  // - ONLY reports 'delivery_test_succeeded' after a distinct test notification confirmed displayed
+  // - Accurately differentiates 'accepted_by_fcm' and 'partial_failure'
   const notificationDeliveryStatus = useMemo<NotificationDeliveryStatus>(() => {
     if (!isFirebaseConfigured()) return 'not_configured';
     if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') {
@@ -2508,11 +2539,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!currentUser || !userConfig.lastSubscriptionSyncAt) {
       return 'token_registered';
     }
-    if (serverDispatchStatus?.recentDelivery?.status === 'failed') {
-      return 'delivery_error';
-    }
-    if (serverDispatchStatus?.recentDelivery?.status === 'delivered') {
+    // Only report 'delivery_test_succeeded' if confirmed on device
+    if (serverDispatchStatus?.deliveryTestSucceeded) {
       return 'delivery_test_succeeded';
+    }
+    // Differentiate FCM accepted vs partial failure
+    if (serverDispatchStatus?.lastTestDelivery?.status === 'accepted_by_fcm') {
+      return 'accepted_by_fcm';
+    }
+    if (serverDispatchStatus?.lastTestDelivery?.status === 'partial_failure') {
+      return 'partial_failure';
+    }
+    // If test failed or scheduler reported failure/degraded state
+    if (
+      serverDispatchStatus?.lastTestDelivery?.status === 'failed' ||
+      serverDispatchStatus?.systemHeartbeatStatus === 'degraded' ||
+      serverDispatchStatus?.systemHeartbeatStatus === 'error' ||
+      serverDispatchStatus?.recentDelivery?.status === 'failed'
+    ) {
+      return 'delivery_error';
     }
     if (serverDispatchStatus?.isBackendDeployed) {
       return 'backend_configured';
@@ -2574,7 +2619,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setNotifications((prev) => [
           {
             id: `push-${Date.now()}`,
-            type: 'spaced_revision',
+            type: 'revision_due',
             title: title || 'PrepPilot • Study Reminder',
             message: body || 'You have an upcoming study session.',
             timestamp: new Date().toISOString(),
@@ -2921,6 +2966,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     resetAllData,
     syncPushSubscriptionToCloud,
     sendLocalTestNotification,
+    sendServerTestNotification,
     registeredDevices,
     refreshRegisteredDevices,
     deactivateDevice,

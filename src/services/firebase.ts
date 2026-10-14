@@ -1630,21 +1630,44 @@ export async function deactivateDeviceSubscription(
 
 export interface ServerStatusCheckResult {
   isBackendDeployed: boolean;
-  statusLabel: string;
+  systemHeartbeatStatus?: 'healthy' | 'degraded' | 'error';
   lastRunAt?: string;
   scheduler?: string;
+  lastRunStats?: {
+    processedUsers: number;
+    totalDispatches: number;
+    successCount: number;
+    failureCount: number;
+    retriedCount?: number;
+    invalidTokensEvicted?: number;
+    lastError?: string | null;
+  };
   recentDelivery?: {
     deliveryId: string;
     timestamp: string;
-    status: 'delivered' | 'failed' | 'skipped';
+    status: 'accepted_by_fcm' | 'delivered' | 'partial_failure' | 'failed' | 'skipped' | 'in_progress';
+    title: string;
+    type?: string;
+    isTest?: boolean;
+    error?: string;
+    attempts?: number;
+  };
+  lastTestDelivery?: {
+    deliveryId: string;
+    timestamp: string;
+    status: 'accepted_by_fcm' | 'delivered' | 'partial_failure' | 'failed';
     title: string;
     error?: string;
   };
+  deliveryTestSucceeded: boolean;
+  statusLabel: string;
+  statusDetails?: string;
 }
 
 /**
  * Queries server deployment health and delivery audit history.
  * A token alone NEVER proves server dispatch is active; this checks for real backend execution.
+ * Only marks deliveryTestSucceeded if a distinct test event was verified.
  */
 export async function fetchServerDispatchStatus(
   userId: string
@@ -1652,6 +1675,7 @@ export async function fetchServerDispatchStatus(
   if (!firestore || !userId) {
     return {
       isBackendDeployed: false,
+      deliveryTestSucceeded: false,
       statusLabel: 'Scheduled delivery not configured',
     };
   }
@@ -1659,56 +1683,212 @@ export async function fetchServerDispatchStatus(
   try {
     // 1. Check system status written strictly by backend Cloud Functions
     let isDeployed = false;
+    let systemHeartbeatStatus: 'healthy' | 'degraded' | 'error' | undefined;
     let lastRunAt: string | undefined;
     let scheduler: string | undefined;
+    let lastRunStats: ServerStatusCheckResult['lastRunStats'];
 
     try {
       const systemSnap = await getDoc(doc(firestore, 'system_status', 'notification_backend'));
       if (systemSnap.exists()) {
         const sysData = systemSnap.data();
-        if (sysData.status === 'healthy') {
+        if (sysData.lastRunAt) {
           isDeployed = true;
+          systemHeartbeatStatus = sysData.status;
           lastRunAt = sysData.lastRunAt;
           scheduler = sysData.scheduler;
+          lastRunStats = sysData.lastRunStats;
         }
       }
     } catch {
       // System status doc not found or permission locked -> backend not verified
     }
 
-    // 2. Check user's delivery audit history for recent dispatches
+    // 2. Check user's delivery audit history for recent dispatches and dedicated test events
     let recentDelivery: ServerStatusCheckResult['recentDelivery'];
+    let lastTestDelivery: ServerStatusCheckResult['lastTestDelivery'];
+    let deliveryTestSucceeded = false;
+
     try {
       const historyCol = collection(firestore, 'user_push_subscriptions', userId, 'delivery_history');
-      const historyQuery = query(historyCol, orderBy('timestamp', 'desc'), limit(1));
+      const historyQuery = query(historyCol, orderBy('timestamp', 'desc'), limit(10));
       const historySnap = await getDocs(historyQuery);
+
       if (!historySnap.empty) {
-        const firstDoc = historySnap.docs[0].data();
-        recentDelivery = {
-          deliveryId: firstDoc.deliveryId || historySnap.docs[0].id,
-          timestamp: firstDoc.timestamp ? new Date(firstDoc.timestamp.toMillis ? firstDoc.timestamp.toMillis() : firstDoc.timestamp).toISOString() : new Date().toISOString(),
-          status: firstDoc.status || 'delivered',
-          title: firstDoc.title || 'Study Prompt',
-          error: firstDoc.error,
-        };
-        // If a real delivery was logged, backend is confirmed active
+        // Any delivery record confirms backend execution has occurred for this user
         isDeployed = true;
+
+        for (const d of historySnap.docs) {
+          const firstDoc = d.data();
+          const deliveryId = firstDoc.deliveryId || d.id;
+          const timestamp = firstDoc.timestamp
+            ? new Date(firstDoc.timestamp.toMillis ? firstDoc.timestamp.toMillis() : firstDoc.timestamp).toISOString()
+            : new Date().toISOString();
+
+          // Set recentDelivery to the first document encountered
+          if (!recentDelivery) {
+            recentDelivery = {
+              deliveryId,
+              timestamp,
+              status: firstDoc.status || 'delivered',
+              title: firstDoc.title || 'Study Prompt',
+              type: firstDoc.type,
+              isTest: Boolean(firstDoc.isTest),
+              error: firstDoc.errorDetails?.[0] || firstDoc.error,
+              attempts: firstDoc.attempts,
+            };
+          }
+
+          // Check if this document represents a dedicated test event
+          if (!lastTestDelivery && (firstDoc.isTest === true || firstDoc.type === 'test_delivery')) {
+            const rawStatus = firstDoc.status;
+            const parsedStatus: 'accepted_by_fcm' | 'delivered' | 'partial_failure' | 'failed' =
+              rawStatus === 'accepted_by_fcm'
+                ? 'accepted_by_fcm'
+                : rawStatus === 'delivered'
+                ? 'delivered'
+                : rawStatus === 'partial_failure'
+                ? 'partial_failure'
+                : 'failed';
+
+            let testError = firstDoc.errorDetails?.[0] || firstDoc.error;
+            if (!testError && firstDoc.deviceOutcomes && typeof firstDoc.deviceOutcomes === 'object') {
+              const outcomes = Object.values(firstDoc.deviceOutcomes) as any[];
+              const failed = outcomes.find((d) => d?.errorMessage || d?.errorCode);
+              if (failed) {
+                testError = failed.errorMessage || failed.errorCode;
+              }
+            }
+
+            lastTestDelivery = {
+              deliveryId,
+              timestamp,
+              status: parsedStatus,
+              title: firstDoc.title || 'Test Delivery',
+              error: testError,
+            };
+            // Only claim true delivery display when confirmedDisplayed is true
+            if (firstDoc.confirmedDisplayed === true || parsedStatus === 'delivered') {
+              deliveryTestSucceeded = true;
+            }
+          }
+        }
       }
     } catch {
       // delivery history empty or not yet dispatched
     }
 
+    // 3. Formulate honest status label
+    let statusLabel = 'Scheduled delivery not configured';
+    let statusDetails: string | undefined;
+
+    if (systemHeartbeatStatus === 'degraded') {
+      if (lastRunStats && lastRunStats.failureCount > 0 && lastRunStats.successCount === 0) {
+        statusLabel = 'Degraded: Scheduler executed but all FCM sends failed';
+        statusDetails = lastRunStats.lastError || 'FCM rejected push tokens';
+      } else {
+        statusLabel = 'Degraded: Partial delivery issues encountered';
+      }
+    } else if (systemHeartbeatStatus === 'error') {
+      statusLabel = 'Backend execution error';
+      statusDetails = lastRunStats?.lastError || 'Unhandled exception in Cloud Function';
+    } else if (isDeployed) {
+      statusLabel = 'Scheduled backend configured';
+    }
+
     return {
       isBackendDeployed: isDeployed,
-      statusLabel: isDeployed ? 'Scheduled backend configured' : 'Scheduled delivery not configured',
+      systemHeartbeatStatus,
       lastRunAt,
       scheduler,
+      lastRunStats,
       recentDelivery,
+      lastTestDelivery,
+      deliveryTestSucceeded,
+      statusLabel,
+      statusDetails,
     };
   } catch (err) {
     return {
       isBackendDeployed: false,
+      deliveryTestSucceeded: false,
       statusLabel: 'Scheduled delivery not configured',
+    };
+  }
+}
+
+/**
+ * Triggers a real server-side push notification to the authenticated user's active devices.
+ * Invokes the secure Cloud Function 'sendUserTestNotification' using the caller's Firebase ID token.
+ */
+export async function triggerServerDeliveryTest(): Promise<{
+  success: boolean;
+  status?: 'accepted_by_fcm' | 'partial_failure' | 'failed';
+  message?: string;
+  acceptedDevices?: number;
+  failedDevices?: number;
+  deliveredDevices?: number;
+  error?: string;
+  deviceOutcomes?: Record<string, any>;
+}> {
+  if (!isFirebaseConfigured() || !auth?.currentUser) {
+    return {
+      success: false,
+      error: 'Firebase is not initialized or user is not signed in. Sign in to test server push delivery.',
+    };
+  }
+
+  try {
+    const idToken = await auth.currentUser.getIdToken(true);
+    const projectId = firebaseConfig?.projectId || import.meta.env.VITE_FIREBASE_PROJECT_ID;
+
+    // Cloud Functions v2 endpoint in asia-south1
+    const baseUrl =
+      import.meta.env.VITE_FIREBASE_FUNCTIONS_URL ||
+      `https://asia-south1-${projectId}.cloudfunctions.net`;
+
+    const endpoint = `${baseUrl}/sendUserTestNotification`;
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+    });
+
+    if (!res.ok) {
+      if (res.status === 404) {
+        return {
+          success: false,
+          error:
+            'Cloud Function "sendUserTestNotification" is not reachable or not yet deployed. Deploy backend functions via "firebase deploy --only functions".',
+        };
+      }
+      const errBody = await res.json().catch(() => null);
+      return {
+        success: false,
+        error: errBody?.error || `Server responded with HTTP ${res.status}`,
+      };
+    }
+
+    const data = await res.json();
+    return {
+      success: Boolean(data.success),
+      status: data.status,
+      message: data.message,
+      acceptedDevices: data.acceptedDevices,
+      failedDevices: data.failedDevices,
+      deliveredDevices: data.acceptedDevices ?? data.deliveredDevices,
+      deviceOutcomes: data.deviceOutcomes,
+    };
+  } catch (err: any) {
+    console.error('Error triggering server delivery test:', err);
+    return {
+      success: false,
+      error:
+        err?.message ||
+        'Network error contacting server test endpoint. Verify backend Cloud Functions deployment.',
     };
   }
 }
