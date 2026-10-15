@@ -2393,6 +2393,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         new Notification('PrepPilot | NIMCET 2027', {
           body: 'Browser notifications enabled! We will alert you of upcoming study sessions and deadlines.',
           icon: '/pwa-192x192.png',
+          badge: '/badge-72x72.png',
         });
       }
       return granted;
@@ -2544,7 +2545,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return 'delivery_test_succeeded';
     }
     // Differentiate FCM accepted vs partial failure
-    if (serverDispatchStatus?.lastTestDelivery?.status === 'accepted_by_fcm') {
+    if (
+      serverDispatchStatus?.lastTestDelivery?.status === 'accepted_by_fcm' ||
+      (serverDispatchStatus?.lastTestDelivery?.status === 'delivered' && !serverDispatchStatus?.deliveryTestSucceeded)
+    ) {
       return 'accepted_by_fcm';
     }
     if (serverDispatchStatus?.lastTestDelivery?.status === 'partial_failure') {
@@ -2666,7 +2670,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             await reg.showNotification(testTitle, {
               body: testBody,
               icon: '/pwa-192x192.png',
-              badge: '/pwa-192x192.png',
+              badge: '/badge-72x72.png',
               tag: 'preppilot-test-verification',
             });
             setUserConfig((prev) => ({ ...prev, lastLocalDeliveryVerifiedAt: nowIso }));
@@ -2680,6 +2684,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       new Notification(testTitle, {
         body: testBody,
         icon: '/pwa-192x192.png',
+        badge: '/badge-72x72.png',
         tag: 'preppilot-test-verification',
       });
       setUserConfig((prev) => ({ ...prev, lastLocalDeliveryVerifiedAt: nowIso }));

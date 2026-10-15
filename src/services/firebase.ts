@@ -30,6 +30,7 @@ import {
   initializeFirestore,
   doc,
   setDoc,
+  updateDoc,
   getDoc,
   deleteDoc,
   collection,
@@ -1397,18 +1398,22 @@ export async function setupWebPushSubscription(): Promise<{
       }
 
       // Display notification using consistent Service Worker notification options
+      const notificationIcon = payload.notification?.icon || payload.data?.icon || '/pwa-192x192.png';
+      const notificationBadge = (payload.notification as Record<string, any> | undefined)?.badge || payload.data?.badge || '/badge-72x72.png';
+
       if (swRegistration && 'showNotification' in swRegistration) {
         swRegistration.showNotification(title, {
           body,
-          icon: '/pwa-192x192.png',
-          badge: '/pwa-192x192.png',
+          icon: notificationIcon,
+          badge: notificationBadge,
           tag,
           data: { url: targetUrl, ...payload.data },
         });
       } else if ('Notification' in window && Notification.permission === 'granted') {
         new Notification(title, {
           body,
-          icon: '/pwa-192x192.png',
+          icon: notificationIcon,
+          badge: notificationBadge,
           tag,
           data: { url: targetUrl, ...payload.data },
         });
@@ -1483,13 +1488,26 @@ export async function registerDevicePushSubscription(
       },
     };
 
-    // 1. Write the device-specific record in subcollection
+    // 1. Write the device-specific record in subcollection. Avoid rewriting an
+    // unchanged FCM token on every registration/page refresh, while still
+    // refreshing activity, device metadata, and notification preferences.
     const sanitizedDevice = sanitizeFirestoreData(deviceRecord);
-    await setDoc(
-      doc(firestore, 'user_push_subscriptions', userId, 'devices', deviceId),
-      sanitizedDevice,
-      { merge: true }
-    );
+    const deviceRef = doc(firestore, 'user_push_subscriptions', userId, 'devices', deviceId);
+    const existingDeviceSnap = await getDoc(deviceRef);
+    if (existingDeviceSnap.exists() && existingDeviceSnap.data().token === options.token) {
+      const deviceMetadata = sanitizeFirestoreData({
+        deviceId,
+        timezone: deviceRecord.timezone,
+        deviceType: deviceRecord.deviceType,
+        deviceLabel: deviceRecord.deviceLabel,
+        active: deviceRecord.active,
+        lastActiveAt: nowIso,
+        notificationPreferences: deviceRecord.notificationPreferences,
+      });
+      await updateDoc(deviceRef, deviceMetadata);
+    } else {
+      await setDoc(deviceRef, sanitizedDevice, { merge: true });
+    }
 
     // 2. Safe migration: check if parent document had a legacy token from an older single-device build
     const parentRef = doc(firestore, 'user_push_subscriptions', userId);
@@ -1529,19 +1547,27 @@ export async function registerDevicePushSubscription(
       }
     }
 
-    // 3. Update root metadata document
-    await setDoc(
-      parentRef,
-      sanitizeFirestoreData({
-        userId,
-        updatedAt: nowIso,
-        lastClientSyncAt: nowIso,
-        lastRegisteredDeviceId: deviceId,
-        // Retain fcmToken for backward compatibility with existing single-token readers
-        fcmToken: options.token,
-      }),
-      { merge: true }
-    );
+    // 3. Update root metadata document. Keep the legacy token field in sync,
+    // but do not write it again when its value has not changed.
+    const rootMetadata = sanitizeFirestoreData({
+      userId,
+      updatedAt: nowIso,
+      lastClientSyncAt: nowIso,
+      lastRegisteredDeviceId: deviceId,
+    });
+    if (parentSnap.exists() && parentSnap.data().fcmToken === options.token) {
+      await updateDoc(parentRef, rootMetadata);
+    } else {
+      await setDoc(
+        parentRef,
+        sanitizeFirestoreData({
+          ...rootMetadata,
+          // Retain fcmToken for backward compatibility with existing single-token readers
+          fcmToken: options.token,
+        }),
+        { merge: true }
+      );
+    }
 
     return { success: true, deviceId, syncedAt: nowIso };
   } catch (err: any) {
@@ -1632,9 +1658,11 @@ export interface ServerStatusCheckResult {
   isBackendDeployed: boolean;
   systemHeartbeatStatus?: 'healthy' | 'degraded' | 'error';
   lastRunAt?: string;
+  schedule?: string;
   scheduler?: string;
   lastRunStats?: {
     processedUsers: number;
+    totalUsersChecked?: number;
     totalDispatches: number;
     successCount: number;
     failureCount: number;
@@ -1658,6 +1686,10 @@ export interface ServerStatusCheckResult {
     status: 'accepted_by_fcm' | 'delivered' | 'partial_failure' | 'failed';
     title: string;
     error?: string;
+    fcmAccepted?: boolean;
+    confirmedDisplayed?: boolean;
+    acceptedDevices?: number;
+    failedDevices?: number;
   };
   deliveryTestSucceeded: boolean;
   statusLabel: string;
@@ -1685,23 +1717,83 @@ export async function fetchServerDispatchStatus(
     let isDeployed = false;
     let systemHeartbeatStatus: 'healthy' | 'degraded' | 'error' | undefined;
     let lastRunAt: string | undefined;
+    let schedule: string | undefined;
     let scheduler: string | undefined;
     let lastRunStats: ServerStatusCheckResult['lastRunStats'];
+    let heartbeatIsStale = false;
 
     try {
       const systemSnap = await getDoc(doc(firestore, 'system_status', 'notification_backend'));
       if (systemSnap.exists()) {
         const sysData = systemSnap.data();
-        if (sysData.lastRunAt) {
-          isDeployed = true;
-          systemHeartbeatStatus = sysData.status;
-          lastRunAt = sysData.lastRunAt;
-          scheduler = sysData.scheduler;
-          lastRunStats = sysData.lastRunStats;
+        if (sysData && sysData.lastRunAt) {
+          // Safely convert Firestore Timestamp, millis, or string to ISO string
+          let isoLastRun: string | undefined;
+          if (typeof sysData.lastRunAt === 'object' && sysData.lastRunAt !== null) {
+            if (typeof sysData.lastRunAt.toDate === 'function') {
+              isoLastRun = sysData.lastRunAt.toDate().toISOString();
+            } else if (typeof sysData.lastRunAt.toMillis === 'function') {
+              isoLastRun = new Date(sysData.lastRunAt.toMillis()).toISOString();
+            } else if (typeof (sysData.lastRunAt as any).seconds === 'number') {
+              isoLastRun = new Date((sysData.lastRunAt as any).seconds * 1000).toISOString();
+            } else if (typeof (sysData.lastRunAt as any)._seconds === 'number') {
+              isoLastRun = new Date((sysData.lastRunAt as any)._seconds * 1000).toISOString();
+            }
+          } else if (typeof sysData.lastRunAt === 'string') {
+            const parsed = new Date(sysData.lastRunAt);
+            if (!isNaN(parsed.getTime())) {
+              isoLastRun = parsed.toISOString();
+            }
+          }
+
+          if (isoLastRun) {
+            lastRunAt = isoLastRun;
+
+            // Check for stale heartbeats. Scheduler runs hourly 08:00–23:00 Asia/Kolkata daily.
+            // If the last run was more than 26 hours ago, the heartbeat is considered stale.
+            const msSinceLastRun = Date.now() - new Date(isoLastRun).getTime();
+            heartbeatIsStale = !isNaN(msSinceLastRun) && msSinceLastRun > 26 * 60 * 60 * 1000;
+
+            const rawStatus = sysData.systemHeartbeatStatus || sysData.status;
+            if (heartbeatIsStale) {
+              systemHeartbeatStatus = 'degraded';
+            } else if (rawStatus === 'healthy' || rawStatus === 'degraded' || rawStatus === 'error') {
+              systemHeartbeatStatus = rawStatus;
+            } else {
+              systemHeartbeatStatus = 'healthy';
+            }
+
+            schedule = sysData.schedule || sysData.scheduler || '0 8-23 * * * (Hourly 08:00-23:00 IST)';
+            scheduler = schedule;
+
+            const rawStats = sysData.lastRunStats || {};
+            const totalChecked =
+              typeof rawStats.totalUsersChecked === 'number'
+                ? rawStats.totalUsersChecked
+                : typeof rawStats.processedUsers === 'number'
+                ? rawStats.processedUsers
+                : 0;
+
+            lastRunStats = {
+              processedUsers: totalChecked,
+              totalUsersChecked: totalChecked,
+              totalDispatches: typeof rawStats.totalDispatches === 'number' ? rawStats.totalDispatches : 0,
+              successCount: typeof rawStats.successCount === 'number' ? rawStats.successCount : 0,
+              failureCount: typeof rawStats.failureCount === 'number' ? rawStats.failureCount : 0,
+              retriedCount: typeof rawStats.retriedCount === 'number' ? rawStats.retriedCount : 0,
+              invalidTokensEvicted: typeof rawStats.invalidTokensEvicted === 'number' ? rawStats.invalidTokensEvicted : 0,
+              lastError: rawStats.lastError || null,
+            };
+
+            // Only mark backend verified deployed when a valid, readable heartbeat document is present
+            isDeployed = true;
+          }
         }
       }
     } catch {
       // System status doc not found or permission locked -> backend not verified
+      isDeployed = false;
+      systemHeartbeatStatus = undefined;
     }
 
     // 2. Check user's delivery audit history for recent dispatches and dedicated test events
@@ -1715,9 +1807,6 @@ export async function fetchServerDispatchStatus(
       const historySnap = await getDocs(historyQuery);
 
       if (!historySnap.empty) {
-        // Any delivery record confirms backend execution has occurred for this user
-        isDeployed = true;
-
         for (const d of historySnap.docs) {
           const firstDoc = d.data();
           const deliveryId = firstDoc.deliveryId || d.id;
@@ -1764,11 +1853,16 @@ export async function fetchServerDispatchStatus(
               deliveryId,
               timestamp,
               status: parsedStatus,
-              title: firstDoc.title || 'Test Delivery',
+              title: firstDoc.title || 'Cloud Push Test',
               error: testError,
+              fcmAccepted: firstDoc.fcmAccepted ?? (parsedStatus === 'accepted_by_fcm' || parsedStatus === 'delivered'),
+              confirmedDisplayed: Boolean(firstDoc.confirmedDisplayed),
+              acceptedDevices: firstDoc.acceptedDevices,
+              failedDevices: firstDoc.failedDevices,
             };
-            // Only claim true delivery display when confirmedDisplayed is true
-            if (firstDoc.confirmedDisplayed === true || parsedStatus === 'delivered') {
+            // Only claim true delivery display when a genuine device-level acknowledgement exists (e.g. confirmedDisplayed === true).
+            // Legacy status: 'delivered' or FCM acceptance ('accepted_by_fcm') does NOT automatically mean device display was confirmed.
+            if (firstDoc.confirmedDisplayed === true) {
               deliveryTestSucceeded = true;
             }
           }
@@ -1782,8 +1876,14 @@ export async function fetchServerDispatchStatus(
     let statusLabel = 'Scheduled delivery not configured';
     let statusDetails: string | undefined;
 
-    if (systemHeartbeatStatus === 'degraded') {
-      if (lastRunStats && lastRunStats.failureCount > 0 && lastRunStats.successCount === 0) {
+    if (!isDeployed || !systemHeartbeatStatus) {
+      statusLabel = 'Scheduled delivery not configured';
+      statusDetails = 'No recent system heartbeat found in Firestore. Deploy Cloud Functions backend to activate.';
+    } else if (systemHeartbeatStatus === 'degraded') {
+      if (heartbeatIsStale) {
+        statusLabel = 'Degraded: Stale backend heartbeat';
+        statusDetails = `Last scheduler run was recorded at ${new Date(lastRunAt || '').toLocaleString()}. The hourly Cloud Scheduler may be inactive.`;
+      } else if (lastRunStats && lastRunStats.failureCount > 0 && lastRunStats.successCount === 0) {
         statusLabel = 'Degraded: Scheduler executed but all FCM sends failed';
         statusDetails = lastRunStats.lastError || 'FCM rejected push tokens';
       } else {
@@ -1792,7 +1892,7 @@ export async function fetchServerDispatchStatus(
     } else if (systemHeartbeatStatus === 'error') {
       statusLabel = 'Backend execution error';
       statusDetails = lastRunStats?.lastError || 'Unhandled exception in Cloud Function';
-    } else if (isDeployed) {
+    } else if (isDeployed && systemHeartbeatStatus === 'healthy') {
       statusLabel = 'Scheduled backend configured';
     }
 
@@ -1800,6 +1900,7 @@ export async function fetchServerDispatchStatus(
       isBackendDeployed: isDeployed,
       systemHeartbeatStatus,
       lastRunAt,
+      schedule,
       scheduler,
       lastRunStats,
       recentDelivery,

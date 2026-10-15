@@ -143,7 +143,9 @@ export const SettingsView: React.FC = () => {
     const res = await sendLocalTestNotification();
     setTestDeliveryLoading(false);
     if (res.success) {
-      setTestDeliveryMessage('Test alert displayed successfully! Notification banner and sound verified.');
+      setTestDeliveryMessage(
+        'Notification API accepted the local test message. Display depends on browser and OS notification settings.'
+      );
     } else {
       setTestDeliveryMessage(res.error || 'Failed to display test notification.');
     }
@@ -994,7 +996,7 @@ export const SettingsView: React.FC = () => {
                 onClick={handleSendTestAlert}
                 disabled={testDeliveryLoading}
                 className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 disabled:opacity-50 cursor-pointer shadow-2xs"
-                title="Send an immediate local test alert to verify browser notification permissions, sound, and banner"
+                title="Send an immediate local test alert to verify browser notification permissions and banner display"
               >
                 <Send className="h-3.5 w-3.5 text-amber-500" />
                 <span>{testDeliveryLoading ? 'Sending...' : 'Test Local Notification'}</span>

@@ -65,8 +65,8 @@ self.addEventListener('push', (event: PushEvent) => {
         payload.notification?.body ||
         payload.body ||
         'You have an upcoming study milestone or revision scheduled.',
-      icon: '/pwa-192x192.png',
-      badge: '/pwa-192x192.png',
+      icon: payload.notification?.icon || payload.icon || '/pwa-192x192.png',
+      badge: payload.notification?.badge || payload.badge || '/badge-72x72.png',
       data: {
         ...(payload.data || {}),
         url: targetUrl,
@@ -82,6 +82,7 @@ self.addEventListener('push', (event: PushEvent) => {
       self.registration.showNotification('PrepPilot • Study Reminder', {
         body: event.data.text() || 'Keep your NIMCET 2027 streak alive today.',
         icon: '/pwa-192x192.png',
+        badge: '/badge-72x72.png',
         tag: 'preppilot-study-reminder',
         data: { url: '/' },
       })

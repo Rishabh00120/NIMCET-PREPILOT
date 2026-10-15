@@ -20,6 +20,7 @@ export interface TimeInfo {
 
 export interface DeviceOutcomeRecord {
   status: 'accepted_by_fcm' | 'delivered' | 'failed' | 'evicted';
+  token?: string;
   fcmAccepted?: boolean;
   confirmedDisplayed?: boolean;
   messageId?: string;
@@ -39,15 +40,37 @@ export type OverallDeliveryStatus =
   | 'in_progress';
 
 /**
+ * Known placeholder patterns that indicate unconfigured deployment values
+ */
+const PLACEHOLDER_HOST_PATTERNS = [
+  'your-preppilot-domain',
+  'your-domain',
+  'your-app',
+  'replace_with',
+  'replace-with',
+  '<your',
+  'your_domain',
+];
+
+/**
  * Validates the configured production application origin.
- * Strictly requires HTTPS in production, rejects credentials, unexpected non-root paths, and malformed URLs.
+ * Strictly requires HTTPS in production, rejects credentials, unexpected non-root paths, malformed URLs,
+ * and placeholder values. Plain HTTP for localhost/127.0.0.1 is permitted strictly in isolated emulator/test environments.
  */
 export function validateAppOrigin(candidateUrl?: string | null): string {
   const urlToTest = candidateUrl ? candidateUrl.trim() : '';
 
   if (!urlToTest) {
     throw new Error(
-      'Missing required PREPPILOT_APP_URL configuration. An explicit, valid HTTPS production origin must be configured (e.g. "https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app").'
+      'Missing required PREPPILOT_APP_URL configuration. An explicit, valid HTTPS production origin must be configured (e.g. "https://preppilot.example.com").'
+    );
+  }
+
+  // Reject obvious placeholder strings or unconfigured template values
+  const lowerUrl = urlToTest.toLowerCase();
+  if (PLACEHOLDER_HOST_PATTERNS.some(pattern => lowerUrl.includes(pattern))) {
+    throw new Error(
+      `Invalid PREPPILOT_APP_URL: Found placeholder origin "${urlToTest}". You must configure PREPPILOT_APP_URL with your actual deployed PrepPilot HTTPS origin before deployment.`
     );
   }
 
@@ -68,10 +91,23 @@ export function validateAppOrigin(candidateUrl?: string | null): string {
     throw new Error(`Invalid PREPPILOT_APP_URL: Unsupported protocol "${parsed.protocol}".`);
   }
 
-  // Require HTTPS protocol (allow http only for localhost or 127.0.0.1 in local development/testing)
+  // Require HTTPS protocol (allow http only for localhost or 127.0.0.1 in isolated local emulator or test runner)
   const isLocalhost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-  if (parsed.protocol !== 'https:' && !isLocalhost) {
-    throw new Error(`Invalid PREPPILOT_APP_URL: Protocol must be HTTPS (received "${parsed.protocol}").`);
+  const isIsolatedEmulatorEnv =
+    process.env.FUNCTIONS_EMULATOR === 'true' ||
+    Boolean(process.env.FIREBASE_EMULATOR_HUB) ||
+    process.env.NODE_ENV === 'test';
+
+  if (parsed.protocol !== 'https:') {
+    if (parsed.protocol === 'http:' && isLocalhost) {
+      if (!isIsolatedEmulatorEnv) {
+        throw new Error(
+          'Invalid PREPPILOT_APP_URL: Protocol must be HTTPS. Plain HTTP for localhost is supported only in an isolated emulator or test environment (FUNCTIONS_EMULATOR=true).'
+        );
+      }
+    } else {
+      throw new Error(`Invalid PREPPILOT_APP_URL: Protocol must be HTTPS (received "${parsed.protocol}").`);
+    }
   }
 
   // Reject invalid hostnames
@@ -305,11 +341,13 @@ export function calculateMulticastOutcomes(params: {
     const resp = fcmResponses[i];
     const dev = devices[i];
     const deviceId = dev ? dev.deviceId : `dev_${i}`;
+    const token = dev ? dev.token : undefined;
 
     if (resp.success) {
       acceptedCount++;
       mergedOutcomes[deviceId] = {
         status: 'accepted_by_fcm',
+        token,
         fcmAccepted: true,
         confirmedDisplayed: false, // Distinguishes FCM acceptance from confirmed device display
         messageId: resp.messageId,
@@ -328,6 +366,7 @@ export function calculateMulticastOutcomes(params: {
         invalidTokensToEvict.push(deviceId);
         mergedOutcomes[deviceId] = {
           status: 'evicted',
+          token,
           fcmAccepted: false,
           confirmedDisplayed: false,
           errorCode: errCode,
@@ -337,6 +376,7 @@ export function calculateMulticastOutcomes(params: {
       } else {
         mergedOutcomes[deviceId] = {
           status: 'failed',
+          token,
           fcmAccepted: false,
           confirmedDisplayed: false,
           errorCode: errCode,
@@ -347,23 +387,121 @@ export function calculateMulticastOutcomes(params: {
     }
   }
 
-  // Determine overall delivery status across all target devices
-  let overallStatus: OverallDeliveryStatus;
-  const total = devices.length;
+  // Determine aggregate delivery status across all resolved devices
+  const allOutcomes = Object.values(mergedOutcomes);
+  const totalAccepted = allOutcomes.filter(
+    (o) => o.status === 'accepted_by_fcm' || o.status === 'delivered'
+  ).length;
+  const totalEvicted = allOutcomes.filter((o) => o.status === 'evicted').length;
+  const totalFailed = allOutcomes.filter((o) => o.status === 'failed').length;
+  const totalAll = allOutcomes.length;
 
-  if (acceptedCount === total && total > 0) {
+  let overallStatus: OverallDeliveryStatus;
+
+  if (totalAccepted === totalAll && totalAll > 0) {
+    // Every targeted device has been accepted by FCM
     overallStatus = 'accepted_by_fcm';
-  } else if (acceptedCount > 0 && failedCount > 0) {
+  } else if (totalAccepted > 0 && (totalFailed > 0 || totalEvicted > 0)) {
+    // At least one device accepted, but some failed or were evicted
     overallStatus = 'partial_failure';
   } else {
+    // 0 devices accepted (e.g. all evicted, all failed, or mixed failed+evicted)
     overallStatus = 'failed';
   }
 
   return {
     deviceOutcomes: mergedOutcomes,
-    acceptedDevicesCount: acceptedCount,
-    failedDevicesCount: failedCount,
+    acceptedDevicesCount: totalAccepted,
+    failedDevicesCount: totalFailed + totalEvicted,
     overallStatus,
     invalidTokensToEvict,
   };
 }
+
+/**
+ * Filters intended active devices to determine which should be targeted in a dispatch or retry attempt.
+ * - If a device has never been targeted, it is included.
+ * - If an evicted or failed device has re-registered with a NEW token, it is included (not suppressed).
+ * - If a device already reached a terminal state (accepted_by_fcm, delivered, or evicted) with the SAME token, it is excluded.
+ */
+export function filterDevicesToTarget(params: {
+  intendedDevices: Array<{ deviceId: string; token: string }>;
+  existingOutcomes: Record<string, DeviceOutcomeRecord>;
+}): Array<{ deviceId: string; token: string }> {
+  const { intendedDevices, existingOutcomes } = params;
+  return intendedDevices.filter((dev) => {
+    const outcome = existingOutcomes[dev.deviceId];
+    if (!outcome) return true;
+
+    // If an evicted or failed device registered a NEW token later, do NOT suppress it
+    if (outcome.token && dev.token && outcome.token !== dev.token) {
+      return true;
+    }
+
+    // Do not retry permanently invalid (evicted) tokens or already accepted/delivered tokens
+    return (
+      outcome.status !== 'accepted_by_fcm' &&
+      outcome.status !== 'delivered' &&
+      outcome.status !== 'evicted'
+    );
+  });
+}
+
+/**
+ * Resolves the aggregate delivery status across all intended devices.
+ * Requires at least 1 FCM accepted device for successful acceptance.
+ * An invalid or evicted token never counts as a successful send.
+ * If 0 devices accepted, returns 'failed'.
+ * If some devices accepted but others failed/evicted, returns 'partial_failure'.
+ * If all devices accepted, returns 'accepted_by_fcm'.
+ */
+export function resolveDeliveryAggregateStatus(params: {
+  intendedDevicesCount: number;
+  deviceOutcomes: Record<string, DeviceOutcomeRecord>;
+}): {
+  status: 'accepted_by_fcm' | 'partial_failure' | 'failed';
+  fcmAccepted: boolean;
+  acceptedCount: number;
+  failedCount: number;
+  evictedCount: number;
+  allResolved: boolean;
+  terminalReason: string;
+} {
+  const { intendedDevicesCount, deviceOutcomes } = params;
+  const outcomes = Object.values(deviceOutcomes);
+
+  const acceptedCount = outcomes.filter(
+    (o) => o.status === 'accepted_by_fcm' || o.status === 'delivered'
+  ).length;
+  const evictedCount = outcomes.filter((o) => o.status === 'evicted').length;
+  const failedCount = outcomes.filter((o) => o.status === 'failed').length;
+
+  const allResolved =
+    outcomes.length >= intendedDevicesCount &&
+    outcomes.every((o) => o.status === 'accepted_by_fcm' || o.status === 'delivered' || o.status === 'evicted');
+
+  let status: 'accepted_by_fcm' | 'partial_failure' | 'failed';
+  let terminalReason: string;
+
+  if (acceptedCount === intendedDevicesCount && intendedDevicesCount > 0) {
+    status = 'accepted_by_fcm';
+    terminalReason = 'all_devices_already_accepted';
+  } else if (acceptedCount > 0) {
+    status = 'partial_failure';
+    terminalReason = 'partial_devices_accepted';
+  } else {
+    status = 'failed';
+    terminalReason = evictedCount > 0 ? 'all_devices_evicted_or_invalid' : 'all_devices_failed';
+  }
+
+  return {
+    status,
+    fcmAccepted: acceptedCount > 0,
+    acceptedCount,
+    failedCount,
+    evictedCount,
+    allResolved,
+    terminalReason,
+  };
+}
+

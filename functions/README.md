@@ -37,7 +37,7 @@ This package contains the server-side scheduled notification dispatcher for Prep
    - Uses Firebase Functions v2 Parameterized Configuration (`defineString('PREPPILOT_APP_URL')`).
    - Requires an explicit, valid HTTPS production origin. Rejects embedded credentials, unexpected subpaths, and malformed URLs.
    - Automatically converts internal SPA hash routes (e.g. `/#/tasks?id=123`, `/#/settings`) into validated absolute HTTPS URLs for `webpush.fcmOptions.link`.
-   - Uses the same validated origin for notification icons and badges (`/pwa-192x192.png`).
+   - Uses the same validated origin for notification icons (`/pwa-192x192.png`) and monochrome status badges (`/badge-72x72.png`).
 
 7. **Atomic Reservation & Bounded Retries**:
    - Atomic reservation using Firestore transactions prevents duplicate concurrent sends across multiple Cloud Function instances.
@@ -68,12 +68,12 @@ firebase use <YOUR_FIREBASE_PROJECT_ID>
 ```
 
 ### 3. Configure Parameterized Environment Variables
-Create or verify `functions/.env` (or configure via Firebase CLI prompts):
+Create or verify `functions/.env` (or configure via Firebase CLI prompts / `.env.<project-id>`):
 ```bash
-# Set your canonical deployed PrepPilot HTTPS origin:
-PREPPILOT_APP_URL=https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app
+# Set your canonical deployed PrepPilot HTTPS origin (e.g. Vercel deployment URL):
+PREPPILOT_APP_URL=https://REPLACE_WITH_YOUR_ACTUAL_DEPLOYED_PREPPILOT_URL
 ```
-*(Firebase Functions v2 automatically reads parameters defined via `defineString` from `functions/.env` or prompts for them during initial deploy).*
+*(Firebase Functions v2 automatically reads parameters defined via `defineString` from `functions/.env` or prompts for them during initial deploy. You must configure the exact HTTPS origin of your deployed web client, e.g. `https://preppilot.vercel.app` or your custom domain. Placeholder domains such as `your-preppilot-domain` or `REPLACE_WITH_...` are intentionally rejected with an explicit error by `validateAppOrigin()` so unconfigured deployments fail fast rather than silently routing notifications to invalid hosts).*
 
 ### 4. Configure Administrative Secret (Secret Manager)
 Set the secret used to protect the global administrative dispatch endpoint:
@@ -123,13 +123,33 @@ curl -X POST https://asia-south1-<YOUR_PROJECT_ID>.cloudfunctions.net/sendUserTe
 ```
 
 ### 3. Local Testing with Emulators
-You can test the Cloud Functions locally before deploying:
+
+Testing Cloud Functions locally requires choosing an approach that suits your testing target:
+
+#### Option A: HTTPS Development Tunnel (Recommended for Real Device Push Testing)
+Web Push notifications and mobile/desktop browsers require a secure HTTPS origin to display notifications and open notification action links (`webpush.fcmOptions.link`). When testing against a local PrepPilot instance on real devices:
+```bash
+# 1. Start your local Vite dev server in the project root
+npm run dev
+
+# 2. Expose port 3000 via a secure HTTPS tunnel (e.g. ngrok or Cloudflare Tunnel)
+ngrok http 3000
+# or: cloudflared tunnel --url http://localhost:3000
+
+# 3. Start Firebase emulators using your tunnel HTTPS origin
+cd functions
+npm run build
+ADMIN_DISPATCH_SECRET="test-secret-123" PREPPILOT_APP_URL="https://<your-tunnel-subdomain>.ngrok-free.app" firebase emulators:start --only functions,firestore
+```
+
+#### Option B: Isolated Emulator Environment (HTTP localhost)
+For testing Cloud Scheduler logic, Firestore triggers, and administrative dispatch endpoints strictly within the local Firebase emulator suite, `firebase emulators:start` automatically runs with `FUNCTIONS_EMULATOR=true`. The origin validator explicitly permits `http://localhost:3000` or `http://127.0.0.1:3000` **only** when running inside an isolated emulator or test environment:
 ```bash
 cd functions
-npm install
 npm run build
-ADMIN_DISPATCH_SECRET="test-secret-123" PREPPILOT_APP_URL="http://localhost:3000" firebase emulators:start --only functions,firestore
+ADMIN_DISPATCH_SECRET="test-secret-123" PREPPILOT_APP_URL="http://localhost:3000" FUNCTIONS_EMULATOR="true" firebase emulators:start --only functions,firestore
 ```
+*(Note: Production environments never allow plain HTTP or localhost origins; attempts to deploy with non-HTTPS or placeholder URLs are rejected by `validateAppOrigin()` to preserve push security).*
 
 Trigger local evaluation:
 ```bash

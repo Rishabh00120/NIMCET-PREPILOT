@@ -22,6 +22,10 @@ export default defineConfig(() => {
           'pwa-192x192.png',
           'pwa-512x512.png',
           'pwa-maskable-512x512.png',
+          'badge-72x72.png',
+          'badge-96x96.png',
+          'badge.png',
+          'badge.svg',
         ],
         manifest: {
           id: '/',

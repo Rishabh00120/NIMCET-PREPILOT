@@ -88,7 +88,7 @@ const messaging = admin.messaging();
 exports.adminDispatchSecret = (0, params_1.defineSecret)('ADMIN_DISPATCH_SECRET');
 // Modern Firebase Functions v2 Parameterized Configuration for production app origin
 exports.preppilotAppUrl = (0, params_1.defineString)('PREPPILOT_APP_URL', {
-    description: 'The canonical HTTPS production URL of PrepPilot (e.g. https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app)',
+    description: 'The canonical HTTPS production URL of PrepPilot (e.g. https://preppilot.example.com or your deployed HTTPS origin)',
     default: process.env.PREPPILOT_APP_URL || '',
 });
 const MAX_RETRIES = 3;
@@ -566,18 +566,47 @@ async function runStudyReminderDispatch() {
                         const existingOutcomes = data.deviceOutcomes || {};
                         const devicesToRetry = intendedDevices.filter((dev) => {
                             const outcome = existingOutcomes[dev.deviceId];
-                            return !outcome || (outcome.status !== 'accepted_by_fcm' && outcome.status !== 'delivered' && outcome.status !== 'evicted');
+                            if (!outcome)
+                                return true;
+                            // If an evicted or failed device registered a NEW token later, do NOT suppress it
+                            if (outcome.token && dev.token && outcome.token !== dev.token) {
+                                return true;
+                            }
+                            // Do not retry permanently invalid (evicted) tokens or already accepted/delivered tokens
+                            return outcome.status !== 'accepted_by_fcm' && outcome.status !== 'delivered' && outcome.status !== 'evicted';
                         });
                         if (devicesToRetry.length === 0) {
-                            // All devices have already received the notification
+                            const acceptedCount = intendedDevices.filter((dev) => {
+                                const o = existingOutcomes[dev.deviceId];
+                                return o && (o.status === 'accepted_by_fcm' || o.status === 'delivered');
+                            }).length;
+                            const evictedCount = intendedDevices.filter((dev) => {
+                                const o = existingOutcomes[dev.deviceId];
+                                return o && o.status === 'evicted';
+                            }).length;
+                            let finalResolvedStatus;
+                            let terminalReason;
+                            if (acceptedCount === intendedDevices.length && intendedDevices.length > 0) {
+                                finalResolvedStatus = 'accepted_by_fcm';
+                                terminalReason = 'all_devices_already_accepted';
+                            }
+                            else if (acceptedCount > 0) {
+                                finalResolvedStatus = 'partial_failure';
+                                terminalReason = 'partial_devices_accepted';
+                            }
+                            else {
+                                finalResolvedStatus = 'failed';
+                                terminalReason = evictedCount > 0 ? 'all_devices_evicted_or_invalid' : 'all_devices_failed';
+                            }
                             transaction.set(deliveryDocRef, {
-                                status: 'accepted_by_fcm',
+                                status: finalResolvedStatus,
+                                fcmAccepted: acceptedCount > 0,
                                 timestamp: admin.firestore.FieldValue.serverTimestamp(),
                                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                             }, { merge: true });
                             return {
                                 eligible: false,
-                                reason: 'all_devices_already_accepted',
+                                reason: terminalReason,
                                 attemptNumber: currentAttempts,
                                 devicesToTarget: [],
                                 existingOutcomes,
@@ -628,7 +657,7 @@ async function runStudyReminderDispatch() {
                             },
                             notification: {
                                 icon: getAbsoluteNotificationUrl('/pwa-192x192.png'),
-                                badge: getAbsoluteNotificationUrl('/pwa-192x192.png'),
+                                badge: getAbsoluteNotificationUrl('/badge-72x72.png'),
                                 tag: reminder.eventId,
                             },
                         },
@@ -655,38 +684,55 @@ async function runStudyReminderDispatch() {
                             }
                         }
                         // Check completion state across all intended devices
-                        const allResolved = intendedDevices.every((dev) => {
+                        const totalIntended = intendedDevices.length;
+                        const acceptedCount = intendedDevices.filter((dev) => {
                             const o = outcomesResult.deviceOutcomes[dev.deviceId];
-                            return o && (o.status === 'accepted_by_fcm' || o.status === 'delivered' || o.status === 'evicted');
-                        });
+                            return o && (o.status === 'accepted_by_fcm' || o.status === 'delivered');
+                        }).length;
                         const hasPendingFailed = intendedDevices.some((dev) => {
                             const o = outcomesResult.deviceOutcomes[dev.deviceId];
                             return o?.status === 'failed';
                         });
+                        // A device is resolved if it reached a terminal state (accepted, delivered, or evicted invalid token)
+                        const allResolved = intendedDevices.every((dev) => {
+                            const o = outcomesResult.deviceOutcomes[dev.deviceId];
+                            return o && (o.status === 'accepted_by_fcm' || o.status === 'delivered' || o.status === 'evicted');
+                        });
                         let finalStatus;
                         let nextRetryAfter = null;
                         if (allResolved) {
-                            finalStatus = 'accepted_by_fcm';
+                            if (acceptedCount === totalIntended && totalIntended > 0) {
+                                // Every intended device succeeded
+                                finalStatus = 'accepted_by_fcm';
+                            }
+                            else if (acceptedCount > 0) {
+                                // Degraded/partial: some devices accepted, others evicted/invalid
+                                finalStatus = 'partial_failure';
+                            }
+                            else {
+                                // Zero devices accepted (e.g. all devices evicted)
+                                finalStatus = 'failed';
+                            }
                         }
                         else if (hasPendingFailed && attemptNumber < MAX_RETRIES) {
-                            finalStatus = outcomesResult.acceptedDevicesCount > 0 ? 'partial_failure' : 'failed';
+                            finalStatus = acceptedCount > 0 ? 'partial_failure' : 'failed';
                             nextRetryAfter = admin.firestore.Timestamp.fromMillis(Date.now() + RETRY_BACKOFF_MS);
                         }
                         else {
-                            finalStatus = outcomesResult.acceptedDevicesCount > 0 ? 'partial_failure' : 'failed';
+                            finalStatus = acceptedCount > 0 ? 'partial_failure' : 'failed';
                         }
                         await deliveryDocRef.set({
                             deliveryId: reminder.eventId,
                             status: finalStatus,
-                            fcmAccepted: outcomesResult.acceptedDevicesCount > 0,
+                            fcmAccepted: acceptedCount > 0,
                             confirmedDisplayed: false, // Accurate: FCM acceptance != confirmed client display
                             title: reminder.title,
                             body: reminder.body,
                             targetUrl: reminder.targetUrl,
                             type: reminder.type,
-                            devicesTargeted: intendedDevices.length,
-                            acceptedDevices: Object.values(outcomesResult.deviceOutcomes).filter((o) => o.status === 'accepted_by_fcm' || o.status === 'delivered').length,
-                            failedDevices: Object.values(outcomesResult.deviceOutcomes).filter((o) => o.status === 'failed').length,
+                            devicesTargeted: totalIntended,
+                            acceptedDevices: acceptedCount,
+                            failedDevices: totalIntended - acceptedCount,
                             attempts: attemptNumber,
                             lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
                             timestamp: admin.firestore.FieldValue.serverTimestamp(),
@@ -704,6 +750,7 @@ async function runStudyReminderDispatch() {
                         for (const dev of devicesToTarget) {
                             mergedOutcomes[dev.deviceId] = {
                                 status: 'failed',
+                                token: dev.token,
                                 fcmAccepted: false,
                                 confirmedDisplayed: false,
                                 errorMessage: errMsg,
@@ -742,9 +789,14 @@ async function runStudyReminderDispatch() {
             appOrigin,
             timeZone: 'Asia/Kolkata',
             schedule: '0 8-23 * * * (Hourly 08:00-23:00 IST)',
-            lastRunAt: admin.firestore.FieldValue.serverTimestamp(),
-            lastRunStats: stats,
+            scheduler: '0 8-23 * * * (Hourly 08:00-23:00 IST)', // legacy alias
             systemHeartbeatStatus: stats.failureCount > 0 ? 'degraded' : 'healthy',
+            status: stats.failureCount > 0 ? 'degraded' : 'healthy', // legacy alias
+            lastRunAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastRunStats: {
+                ...stats,
+                processedUsers: stats.totalUsersChecked, // legacy alias for frontend compatibility
+            },
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
     }
@@ -894,8 +946,8 @@ exports.sendUserTestNotification = (0, https_1.onRequest)(async (req, res) => {
         const fcmMessage = {
             tokens: activeTokens,
             notification: {
-                title: 'PrepPilot • Delivery Test Verified',
-                body: 'Real server-side FCM dispatch verified! Your background study notification path is operational.',
+                title: 'PrepPilot • Cloud Push Test',
+                body: 'Firebase Cloud Messaging accepted a test message. Actual display depends on device and browser notification settings.',
             },
             data: {
                 tag: testEventId,
@@ -910,7 +962,7 @@ exports.sendUserTestNotification = (0, https_1.onRequest)(async (req, res) => {
                 },
                 notification: {
                     icon: getAbsoluteNotificationUrl('/pwa-192x192.png'),
-                    badge: getAbsoluteNotificationUrl('/pwa-192x192.png'),
+                    badge: getAbsoluteNotificationUrl('/badge-72x72.png'),
                     tag: testEventId,
                 },
             },
@@ -940,8 +992,8 @@ exports.sendUserTestNotification = (0, https_1.onRequest)(async (req, res) => {
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
-            title: 'PrepPilot • Delivery Test Verified',
-            body: 'Real server-side FCM dispatch verified! Your background study notification path is operational.',
+            title: 'PrepPilot • Cloud Push Test',
+            body: 'Firebase Cloud Messaging accepted a test message. Actual display depends on device and browser notification settings.',
             targetUrl,
             fullUrl: absoluteLink,
             type: 'test_delivery',
@@ -955,7 +1007,7 @@ exports.sendUserTestNotification = (0, https_1.onRequest)(async (req, res) => {
         // Detailed user message
         let message;
         if (isFullAcceptance) {
-            message = `FCM Accepted: Message accepted by Firebase Cloud Messaging for ${outcomesResult.acceptedDevicesCount} active device(s). (Note: Verifies server transmission; client display requires device wake & system permissions).`;
+            message = `FCM Accepted: Message accepted by Firebase Cloud Messaging for ${outcomesResult.acceptedDevicesCount} active device(s). Actual display depends on device and browser notification settings.`;
         }
         else if (isPartialFailure) {
             message = `Partial Dispatch Warning: FCM accepted ${outcomesResult.acceptedDevicesCount} device(s), but failed for ${outcomesResult.failedDevicesCount} device(s). Check device token validity in Settings.`;

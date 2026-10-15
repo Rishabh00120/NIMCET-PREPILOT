@@ -60,7 +60,27 @@ async function generate() {
     ])
     .png()
     .toFile(path.resolve('public/pwa-maskable-512x512.png'));
-  console.log('Generated pwa-maskable-512x512.png with safe-zone padding');
+  // 6. Notification badges (monochrome stencil on transparent background)
+  const badgeSvgPath = path.resolve('public/badge.svg');
+  const badgeSvgBuffer = fs.readFileSync(badgeSvgPath);
+
+  await sharp(badgeSvgBuffer)
+    .resize(72, 72)
+    .png()
+    .toFile(path.resolve('public/badge-72x72.png'));
+  console.log('Generated badge-72x72.png');
+
+  await sharp(badgeSvgBuffer)
+    .resize(96, 96)
+    .png()
+    .toFile(path.resolve('public/badge-96x96.png'));
+  console.log('Generated badge-96x96.png');
+
+  await sharp(badgeSvgBuffer)
+    .resize(96, 96)
+    .png()
+    .toFile(path.resolve('public/badge.png'));
+  console.log('Generated badge.png');
 }
 
 generate().catch((err) => {

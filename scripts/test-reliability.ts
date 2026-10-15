@@ -9,6 +9,8 @@
  */
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   getTodayDateString,
   addDaysToDateString,
@@ -43,6 +45,8 @@ import {
   isHourInWindow,
   isReminderWindowEligible,
   calculateMulticastOutcomes,
+  filterDevicesToTarget,
+  resolveDeliveryAggregateStatus,
   getTimeInfo,
 } from '../functions/src/notificationUtils';
 
@@ -1337,32 +1341,78 @@ runTest('Invalid URL formats, protocols, credentials, and non-root subpaths are 
   // Invalid hostname
   assert.throws(() => validateAppOrigin('https://localhost-fake'), /is not a valid production host/);
 
-  // Valid HTTPS production URL accepted
-  const validProd = validateAppOrigin('https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app');
-  assert.strictEqual(validProd, 'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app');
+  // Placeholder URLs are rejected with explicit instructions
+  assert.throws(
+    () => validateAppOrigin('https://your-preppilot-domain.vercel.app'),
+    /Found placeholder origin/
+  );
+  assert.throws(
+    () => validateAppOrigin('https://REPLACE_WITH_YOUR_ACTUAL_DEPLOYED_PREPPILOT_URL'),
+    /Found placeholder origin/
+  );
+  assert.throws(
+    () => validateAppOrigin('https://<your-domain>.vercel.app'),
+    /Found placeholder origin/
+  );
 
-  // Localhost allowed for development/testing
+  // Valid HTTPS production URL accepted
+  const validProd = validateAppOrigin('https://preppilot.example.com');
+  assert.strictEqual(validProd, 'https://preppilot.example.com');
+
+  // Valid HTTPS development tunnel accepted
+  const validTunnel = validateAppOrigin('https://local-preppilot.ngrok-free.app');
+  assert.strictEqual(validTunnel, 'https://local-preppilot.ngrok-free.app');
+
+  // In isolated emulator/test runner (NODE_ENV=test or FUNCTIONS_EMULATOR=true), localhost HTTP is permitted
+  process.env.NODE_ENV = 'test';
   const validDev = validateAppOrigin('http://localhost:3000');
   assert.strictEqual(validDev, 'http://localhost:3000');
+
+  // In non-emulator/production environment, plain HTTP localhost is rejected to protect push security
+  const prevNodeEnv = process.env.NODE_ENV;
+  const prevEmulator = process.env.FUNCTIONS_EMULATOR;
+  delete process.env.NODE_ENV;
+  delete process.env.FUNCTIONS_EMULATOR;
+  delete process.env.FIREBASE_EMULATOR_HUB;
+
+  assert.throws(
+    () => validateAppOrigin('http://localhost:3000'),
+    /Plain HTTP for localhost is supported only in an isolated emulator/
+  );
+
+  // Restore test environment
+  process.env.NODE_ENV = prevNodeEnv;
+  if (prevEmulator !== undefined) process.env.FUNCTIONS_EMULATOR = prevEmulator;
 });
 
 runTest('Correct absolute HTTPS notification links are constructed with hash routes preserved', () => {
-  const origin = 'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app';
+  const origin = 'https://preppilot.example.com';
 
   assert.strictEqual(
     getAbsoluteNotificationUrl('/#/tasks?id=task_123', origin),
-    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/#/tasks?id=task_123'
+    'https://preppilot.example.com/#/tasks?id=task_123'
   );
 
   assert.strictEqual(
     getAbsoluteNotificationUrl('/#/settings', origin),
-    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/#/settings'
+    'https://preppilot.example.com/#/settings'
   );
 
   assert.strictEqual(
     getAbsoluteNotificationUrl('/pwa-192x192.png', origin),
-    'https://ais-dev-cor4kmqaedoz6lvhxagzys-915145878473.asia-southeast1.run.app/pwa-192x192.png'
+    'https://preppilot.example.com/pwa-192x192.png'
   );
+
+  assert.strictEqual(
+    getAbsoluteNotificationUrl('/badge-72x72.png', origin),
+    'https://preppilot.example.com/badge-72x72.png'
+  );
+
+  // Notification brand assets exist in public directory
+  assert.ok(fs.existsSync(path.resolve('public/pwa-192x192.png')), 'pwa-192x192.png must exist');
+  assert.ok(fs.existsSync(path.resolve('public/badge-72x72.png')), 'badge-72x72.png must exist');
+  assert.ok(fs.existsSync(path.resolve('public/badge-96x96.png')), 'badge-96x96.png must exist');
+  assert.ok(fs.existsSync(path.resolve('public/badge.svg')), 'badge.svg must exist');
 
   // Mismatched external URLs are rejected
   assert.throws(
@@ -1428,6 +1478,121 @@ runTest('Accurate FCM acceptance versus delivery statuses and permanent invalid 
   });
   assert.strictEqual(fullSuccessResult.overallStatus, 'accepted_by_fcm');
   assert.strictEqual(fullSuccessResult.deviceOutcomes['device-1'].confirmedDisplayed, false);
+});
+
+runTest('All-invalid tokens & all-devices evicted records failure outcome without false FCM acceptance', () => {
+  const devices = [
+    { deviceId: 'dev-1', token: 'invalid-token-1' },
+    { deviceId: 'dev-2', token: 'unregistered-token-2' },
+  ];
+
+  const fcmResponses = [
+    { success: false, error: { code: 'messaging/invalid-registration-token', message: 'Invalid token' } },
+    { success: false, error: { code: 'messaging/registration-token-not-registered', message: 'Token not registered' } },
+  ];
+
+  const result = calculateMulticastOutcomes({ devices, fcmResponses });
+
+  assert.strictEqual(result.overallStatus, 'failed');
+  assert.strictEqual(result.acceptedDevicesCount, 0);
+  assert.strictEqual(result.failedDevicesCount, 2);
+  assert.strictEqual(result.invalidTokensToEvict.length, 2);
+  assert.strictEqual(result.invalidTokensToEvict.includes('dev-1'), true);
+  assert.strictEqual(result.invalidTokensToEvict.includes('dev-2'), true);
+  assert.strictEqual(result.deviceOutcomes['dev-1'].status, 'evicted');
+  assert.strictEqual(result.deviceOutcomes['dev-2'].status, 'evicted');
+  assert.strictEqual(result.deviceOutcomes['dev-1'].fcmAccepted, false);
+  assert.strictEqual(result.deviceOutcomes['dev-2'].fcmAccepted, false);
+
+  // Verify terminal aggregate status resolution evaluates to 'failed', never 'accepted_by_fcm'
+  const aggResult = resolveDeliveryAggregateStatus({
+    intendedDevicesCount: 2,
+    deviceOutcomes: result.deviceOutcomes,
+  });
+  assert.strictEqual(aggResult.status, 'failed');
+  assert.strictEqual(aggResult.fcmAccepted, false);
+  assert.strictEqual(aggResult.acceptedCount, 0);
+  assert.strictEqual(aggResult.evictedCount, 2);
+  assert.strictEqual(aggResult.allResolved, true);
+  assert.strictEqual(aggResult.terminalReason, 'all_devices_evicted_or_invalid');
+});
+
+runTest('Mixed accepted and evicted devices records partial_failure status accurately', () => {
+  const devices = [
+    { deviceId: 'dev-laptop', token: 'valid-laptop-token' },
+    { deviceId: 'dev-phone', token: 'stale-phone-token' },
+  ];
+
+  const fcmResponses = [
+    { success: true, messageId: 'msg-laptop-success' },
+    { success: false, error: { code: 'messaging/registration-token-not-registered', message: 'Stale token' } },
+  ];
+
+  const result = calculateMulticastOutcomes({ devices, fcmResponses });
+
+  assert.strictEqual(result.overallStatus, 'partial_failure');
+  assert.strictEqual(result.acceptedDevicesCount, 1);
+  assert.strictEqual(result.failedDevicesCount, 1);
+  assert.strictEqual(result.deviceOutcomes['dev-laptop'].status, 'accepted_by_fcm');
+  assert.strictEqual(result.deviceOutcomes['dev-laptop'].fcmAccepted, true);
+  assert.strictEqual(result.deviceOutcomes['dev-phone'].status, 'evicted');
+  assert.strictEqual(result.deviceOutcomes['dev-phone'].fcmAccepted, false);
+  assert.deepStrictEqual(result.invalidTokensToEvict, ['dev-phone']);
+
+  // Aggregate resolution reflects partial failure
+  const aggResult = resolveDeliveryAggregateStatus({
+    intendedDevicesCount: 2,
+    deviceOutcomes: result.deviceOutcomes,
+  });
+  assert.strictEqual(aggResult.status, 'partial_failure');
+  assert.strictEqual(aggResult.fcmAccepted, true);
+  assert.strictEqual(aggResult.acceptedCount, 1);
+  assert.strictEqual(aggResult.evictedCount, 1);
+  assert.strictEqual(aggResult.allResolved, true);
+  assert.strictEqual(aggResult.terminalReason, 'partial_devices_accepted');
+});
+
+runTest('New token re-registration after eviction allows retry and avoids terminal suppression', () => {
+  // Existing outcomes: dev-phone was evicted with 'old-phone-token'
+  // dev-laptop was accepted with 'valid-laptop-token'
+  const existingOutcomes = {
+    'dev-phone': {
+      status: 'evicted' as const,
+      token: 'old-phone-token',
+      fcmAccepted: false,
+      errorCode: 'messaging/registration-token-not-registered',
+    },
+    'dev-laptop': {
+      status: 'accepted_by_fcm' as const,
+      token: 'valid-laptop-token',
+      fcmAccepted: true,
+    },
+  };
+
+  // Case 1: Phone has NOT re-registered (same old token). Should NOT be retried endlessly.
+  const devicesWithoutNewToken = [
+    { deviceId: 'dev-phone', token: 'old-phone-token' },
+    { deviceId: 'dev-laptop', token: 'valid-laptop-token' },
+  ];
+  const retryTargets1 = filterDevicesToTarget({
+    intendedDevices: devicesWithoutNewToken,
+    existingOutcomes,
+  });
+  assert.strictEqual(retryTargets1.length, 0); // No devices eligible to retry (laptop accepted, phone evicted)
+
+  // Case 2: Phone re-registered with a brand NEW token ('fresh-phone-token-2026').
+  // Previous eviction MUST NOT suppress this newly registered token!
+  const devicesWithNewToken = [
+    { deviceId: 'dev-phone', token: 'fresh-phone-token-2026' },
+    { deviceId: 'dev-laptop', token: 'valid-laptop-token' },
+  ];
+  const retryTargets2 = filterDevicesToTarget({
+    intendedDevices: devicesWithNewToken,
+    existingOutcomes,
+  });
+  assert.strictEqual(retryTargets2.length, 1);
+  assert.strictEqual(retryTargets2[0].deviceId, 'dev-phone');
+  assert.strictEqual(retryTargets2[0].token, 'fresh-phone-token-2026');
 });
 
 runTest('Study and revision window enforcement with quiet hours and explicit urgent bypass', () => {
@@ -1559,6 +1724,130 @@ runTest('Retry eligibility and deduplication logic', () => {
   });
   assert.strictEqual(retryOutsideWindow.eligible, false);
   assert.strictEqual(retryOutsideWindow.reason, 'outside_study_window_urgent_bypass_disabled');
+});
+
+runTest('Backend health schema normalization, timestamp ISO conversion, and stale detection', () => {
+  // Test helper replicating the normalizer in fetchServerDispatchStatus
+  function normalizeHeartbeatDoc(sysData: any, nowMs = Date.now()) {
+    if (!sysData || !sysData.lastRunAt) {
+      return { isDeployed: false, systemHeartbeatStatus: undefined };
+    }
+
+    let isoLastRun: string | undefined;
+    if (typeof sysData.lastRunAt === 'object' && sysData.lastRunAt !== null) {
+      if (typeof sysData.lastRunAt.toDate === 'function') {
+        isoLastRun = sysData.lastRunAt.toDate().toISOString();
+      } else if (typeof sysData.lastRunAt.toMillis === 'function') {
+        isoLastRun = new Date(sysData.lastRunAt.toMillis()).toISOString();
+      } else if (typeof sysData.lastRunAt.seconds === 'number') {
+        isoLastRun = new Date(sysData.lastRunAt.seconds * 1000).toISOString();
+      } else if (typeof sysData.lastRunAt._seconds === 'number') {
+        isoLastRun = new Date(sysData.lastRunAt._seconds * 1000).toISOString();
+      }
+    } else if (typeof sysData.lastRunAt === 'string') {
+      const parsed = new Date(sysData.lastRunAt);
+      if (!isNaN(parsed.getTime())) {
+        isoLastRun = parsed.toISOString();
+      }
+    }
+
+    if (!isoLastRun) {
+      return { isDeployed: false, systemHeartbeatStatus: undefined };
+    }
+
+    const msSinceLastRun = nowMs - new Date(isoLastRun).getTime();
+    const isStale = !isNaN(msSinceLastRun) && msSinceLastRun > 26 * 60 * 60 * 1000;
+
+    const rawStatus = sysData.systemHeartbeatStatus || sysData.status;
+    let systemHeartbeatStatus: 'healthy' | 'degraded' | 'error' = 'healthy';
+    if (isStale) {
+      systemHeartbeatStatus = 'degraded';
+    } else if (rawStatus === 'healthy' || rawStatus === 'degraded' || rawStatus === 'error') {
+      systemHeartbeatStatus = rawStatus;
+    }
+
+    const schedule = sysData.schedule || sysData.scheduler || '0 8-23 * * * (Hourly 08:00-23:00 IST)';
+    const rawStats = sysData.lastRunStats || {};
+    const totalChecked =
+      typeof rawStats.totalUsersChecked === 'number'
+        ? rawStats.totalUsersChecked
+        : typeof rawStats.processedUsers === 'number'
+        ? rawStats.processedUsers
+        : 0;
+
+    return {
+      isDeployed: true,
+      systemHeartbeatStatus,
+      lastRunAt: isoLastRun,
+      schedule,
+      scheduler: schedule,
+      isStale,
+      lastRunStats: {
+        processedUsers: totalChecked,
+        totalUsersChecked: totalChecked,
+        totalDispatches: typeof rawStats.totalDispatches === 'number' ? rawStats.totalDispatches : 0,
+        successCount: typeof rawStats.successCount === 'number' ? rawStats.successCount : 0,
+        failureCount: typeof rawStats.failureCount === 'number' ? rawStats.failureCount : 0,
+      },
+    };
+  }
+
+  // 1. Missing or empty heartbeat doc must NOT be treated as healthy backend
+  const emptyRes = normalizeHeartbeatDoc(null);
+  assert.strictEqual(emptyRes.isDeployed, false);
+  assert.strictEqual(emptyRes.systemHeartbeatStatus, undefined);
+
+  // 2. Mock Firestore Timestamp object with toDate()
+  const freshDate = new Date('2026-10-15T08:00:00.000Z');
+  const now = new Date('2026-10-15T09:00:00.000Z').getTime();
+  const mockTimestamp = {
+    toDate: () => freshDate,
+  };
+  const docWithTimestamp = {
+    systemHeartbeatStatus: 'healthy',
+    schedule: '0 8-23 * * * (Hourly 08:00-23:00 IST)',
+    lastRunAt: mockTimestamp,
+    lastRunStats: {
+      totalUsersChecked: 42,
+      totalDispatches: 5,
+      successCount: 5,
+      failureCount: 0,
+    },
+  };
+  const parsedFresh = normalizeHeartbeatDoc(docWithTimestamp, now);
+  assert.strictEqual(parsedFresh.isDeployed, true);
+  assert.strictEqual(parsedFresh.systemHeartbeatStatus, 'healthy');
+  assert.strictEqual(parsedFresh.lastRunAt, freshDate.toISOString());
+  assert.strictEqual(parsedFresh.schedule, '0 8-23 * * * (Hourly 08:00-23:00 IST)');
+  assert.strictEqual(parsedFresh.lastRunStats?.processedUsers, 42);
+  assert.strictEqual(parsedFresh.lastRunStats?.totalUsersChecked, 42);
+  assert.strictEqual(parsedFresh.isStale, false);
+
+  // 3. Stale heartbeat (>26 hours old) must be marked 'degraded'
+  const staleNow = new Date('2026-10-17T09:00:00.000Z').getTime(); // 49 hours later
+  const parsedStale = normalizeHeartbeatDoc(docWithTimestamp, staleNow);
+  assert.strictEqual(parsedStale.isDeployed, true);
+  assert.strictEqual(parsedStale.isStale, true);
+  assert.strictEqual(parsedStale.systemHeartbeatStatus, 'degraded');
+
+  // 4. Legacy record with 'status', 'scheduler', and 'processedUsers'
+  const legacyDoc = {
+    status: 'healthy',
+    scheduler: '0 8-23 * * * (Hourly 08:00-23:00 IST)',
+    lastRunAt: freshDate.toISOString(),
+    lastRunStats: {
+      processedUsers: 15,
+      totalDispatches: 2,
+      successCount: 2,
+      failureCount: 0,
+    },
+  };
+  const parsedLegacy = normalizeHeartbeatDoc(legacyDoc, now);
+  assert.strictEqual(parsedLegacy.isDeployed, true);
+  assert.strictEqual(parsedLegacy.systemHeartbeatStatus, 'healthy');
+  assert.strictEqual(parsedLegacy.schedule, '0 8-23 * * * (Hourly 08:00-23:00 IST)');
+  assert.strictEqual(parsedLegacy.lastRunStats?.processedUsers, 15);
+  assert.strictEqual(parsedLegacy.lastRunStats?.totalUsersChecked, 15);
 });
 
 console.log(`\n====================================================`);
